@@ -33,7 +33,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 const ADDRESS: &str = "127.0.0.1:35185";
-const IPC_PROTOCOL_VERSION: u16 = 2;
+const IPC_PROTOCOL_VERSION: u16 = 3;
 const TUI_PAGE_SIZE: usize = 200;
 const CLI_DEFAULT_LIMIT: usize = 1_000;
 const MAX_SEARCH_LIMIT: usize = 10_000;
@@ -98,6 +98,9 @@ enum Request {
         to: String,
     },
     Open {
+        path: String,
+    },
+    OpenParent {
         path: String,
     },
 }
@@ -379,6 +382,10 @@ fn handle_client(mut stream: TcpStream, index: &Index, token: &str) -> Result<()
             Ok(()) => Response::Ok("opened".into()),
             Err(error) => Response::Error(error.to_string()),
         },
+        Request::OpenParent { path } => match open_parent_path(Path::new(&path)) {
+            Ok(()) => Response::Ok("opened containing directory".into()),
+            Err(error) => Response::Error(error.to_string()),
+        },
     };
     write_response(&mut stream, &response)
 }
@@ -470,6 +477,16 @@ fn delete_path(path: &Path) -> Result<()> {
         fs::remove_file(path)?;
     }
     Ok(())
+}
+
+fn containing_directory(path: &Path) -> Result<&Path> {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .context("selected path has no containing directory")
+}
+
+fn open_parent_path(path: &Path) -> Result<()> {
+    open_path(containing_directory(path)?)
 }
 
 fn open_path(path: &Path) -> Result<()> {
@@ -734,6 +751,9 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<b
                 if app.selected.saturating_add(40) >= app.results.len() {
                     app.load_more();
                 }
+            }
+            KeyCode::Enter if modifiers.contains(KeyModifiers::SHIFT) => {
+                operate(app, |path| Request::OpenParent { path })
             }
             KeyCode::Enter => operate(app, |path| Request::Open { path }),
             KeyCode::Delete => {
@@ -1133,7 +1153,7 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
     );
     frame.render_widget(
         Paragraph::new(format!(
-            " {}  │ ↑↓ 选择 │ Enter 打开 │ F2 重命名 │ Delete 删除 │ Esc/Ctrl-C 退出",
+            " {}  │ ↑↓ 选择 │ Enter 打开 │ Shift+Enter 所在目录 │ F2 重命名 │ Delete 删除 │ Esc/Ctrl-C 退出",
             app.status
         ))
         .wrap(Wrap { trim: true }),
@@ -1260,6 +1280,15 @@ mod tests {
         assert_eq!(centered_list_offset(40, 100, 11), 35);
         assert_eq!(centered_list_offset(99, 100, 11), 89);
         assert_eq!(centered_list_offset(3, 4, 11), 0);
+    }
+
+    #[test]
+    fn resolves_containing_directory_without_opening_it() {
+        assert_eq!(
+            containing_directory(Path::new("/home/think/report.txt")).unwrap(),
+            Path::new("/home/think")
+        );
+        assert!(containing_directory(Path::new("")).is_err());
     }
 
     #[test]

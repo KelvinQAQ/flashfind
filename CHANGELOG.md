@@ -2,6 +2,16 @@
 
 All notable changes to FlashFind are documented in this file.
 
+## [0.1.5] - 2026-09-03
+
+### Added
+
+- `Shift+Enter` opens the selected entry's containing directory using the platform file manager.
+
+### Fixed
+
+- Bumped the local IPC protocol after adding the containing-directory request, so clients require a daemon restart rather than sending the new action to an older service.
+
 ## [0.1.4] - 2026-09-03
 
 ### Fixed

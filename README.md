@@ -89,7 +89,8 @@ invoice | receipt      # OR
 | 按键 | 操作 |
 |---|---|
 | `↑` / `↓`、`PageUp` / `PageDown` | 选择结果 |
-| `Enter` | 用系统默认程序打开 |
+| `Enter` | 用系统默认程序打开所选文件/目录 |
+| `Shift+Enter` | 用系统文件管理器打开所选条目的所在目录 |
 | `F2` | 重命名（输入完整目标路径后回车） |
 | `Delete` | 删除，随后需 `y` 或 `Enter` 确认 |
 | `Backspace` / `Ctrl-H` | 删除一个完整 Unicode 字素（中文、emoji 也不会被截断） |
