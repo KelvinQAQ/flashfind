@@ -2,6 +2,13 @@
 
 All notable changes to FlashFind are documented in this file.
 
+## [0.1.4] - 2026-09-03
+
+### Fixed
+
+- Rebuilt legacy `files.grams NOT NULL` tables during migration; this prevents every new entry from being silently skipped and makes existing indexes writable again.
+- Escalated non-filesystem index errors instead of counting them as skipped paths.
+
 ## [0.1.3] - 2026-09-03
 
 ### Fixed

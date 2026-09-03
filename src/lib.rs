@@ -97,7 +97,7 @@ impl Index {
     }
 
     pub fn open(database: impl AsRef<Path>) -> Result<Self> {
-        let connection = Connection::open(database).context("could not open SQLite index")?;
+        let mut connection = Connection::open(database).context("could not open SQLite index")?;
         connection
             .pragma_update(None, "journal_mode", "WAL")
             .context("could not enable SQLite WAL mode")?;
@@ -141,7 +141,7 @@ impl Index {
             END;
             "#,
         )?;
-        migrate_name_index(&connection)?;
+        migrate_name_index(&mut connection)?;
         Ok(Self { connection })
     }
 
@@ -195,7 +195,13 @@ impl Index {
             for path in paths {
                 match insert_path(&mut insert, &path, root) {
                     Ok(()) => stats.indexed += 1,
-                    Err(_) => stats.skipped += 1,
+                    Err(error) if is_skippable_filesystem_error(&error) => stats.skipped += 1,
+                    // Database/schema failures are never silently counted as
+                    // inaccessible files: that would produce a false-success
+                    // index with zero entries.
+                    Err(error) => {
+                        return Err(error.context(format!("could not index {}", path.display())))
+                    }
                 }
             }
         }
@@ -225,7 +231,11 @@ impl Index {
         remove_path(&transaction, &path_text(&path))?;
         if path.exists() {
             let mut insert = transaction.prepare_cached(INSERT_SQL)?;
-            let _ = insert_path(&mut insert, &path, &root);
+            if let Err(error) = insert_path(&mut insert, &path, &root) {
+                if !is_skippable_filesystem_error(&error) {
+                    return Err(error.context(format!("could not refresh {}", path.display())));
+                }
+            }
         }
         transaction.commit()?;
         Ok(())
@@ -429,52 +439,70 @@ pub fn default_roots() -> Result<Vec<PathBuf>> {
     Ok(vec![home.home_dir().to_path_buf()])
 }
 
-/// Migrates the pre-name-search database layout. The old layout stored path
-/// trigrams in `files.grams`; retaining it would incorrectly let a directory
-/// name match every descendant. Rebuilding FTS from `name_grams` is fast and
-/// atomic at SQLite level; filesystem entries themselves are not re-walked.
-fn migrate_name_index(connection: &Connection) -> Result<()> {
-    let file_columns = connection
-        .prepare("PRAGMA table_info(files)")?
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+/// Migrates every pre-name-search schema to the current name-only layout.
+///
+/// Some old databases retain `files.grams TEXT NOT NULL`. Simply adding
+/// `name_grams` leaves this legacy constraint in place, so modern inserts fail
+/// before triggers run. Rebuild the table transactionally to remove it, then
+/// rebuild FTS from names.
+fn migrate_name_index(connection: &mut Connection) -> Result<()> {
+    let file_columns = table_columns(connection, "files")?;
+    let has_legacy_grams = file_columns.iter().any(|column| column == "grams");
     let has_name_grams = file_columns.iter().any(|column| column == "name_grams");
-    // A short-lived development layout had `files.name_grams` but retained an
-    // FTS column named `grams`. Check both schemas; checking only the table
-    // field would leave that index unusable and make broad queries look empty.
-    let fts_columns = connection
-        .prepare("PRAGMA table_info(file_grams)")?
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let fts_is_current = fts_columns.iter().any(|column| column == "name_grams");
-    if has_name_grams && fts_is_current {
+    let fts_is_current = table_columns(connection, "file_grams")?
+        .iter()
+        .any(|column| column == "name_grams");
+    if !has_legacy_grams && has_name_grams && fts_is_current {
         return Ok(());
     }
-    connection.execute_batch(
+
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(
         "DROP TRIGGER IF EXISTS files_ai;
          DROP TRIGGER IF EXISTS files_ad;
-         DROP TRIGGER IF EXISTS files_au;",
+         DROP TRIGGER IF EXISTS files_au;
+         DROP TABLE IF EXISTS file_grams;",
     )?;
-    if !has_name_grams {
-        connection.execute(
+    if has_legacy_grams {
+        transaction.execute_batch(
+            "CREATE TABLE files_current (
+                id          INTEGER PRIMARY KEY,
+                path        TEXT NOT NULL UNIQUE,
+                path_folded TEXT NOT NULL,
+                name        TEXT NOT NULL,
+                name_folded TEXT NOT NULL,
+                name_grams  TEXT NOT NULL,
+                kind        TEXT NOT NULL,
+                size        INTEGER NOT NULL,
+                modified    INTEGER,
+                root        TEXT NOT NULL
+            );
+            INSERT INTO files_current(id, path, path_folded, name, name_folded, name_grams, kind, size, modified, root)
+            SELECT id, path, path_folded, name, name_folded, '', kind, size, modified, root FROM files;
+            DROP TABLE files;
+            ALTER TABLE files_current RENAME TO files;
+            CREATE INDEX files_root ON files(root);
+            CREATE INDEX files_name_folded ON files(name_folded);",
+        )?;
+    } else if !has_name_grams {
+        transaction.execute(
             "ALTER TABLE files ADD COLUMN name_grams TEXT NOT NULL DEFAULT ''",
             [],
         )?;
     }
-    let names = connection
+    let names = transaction
         .prepare("SELECT id, name_folded FROM files")?
         .query_map([], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut update = connection.prepare("UPDATE files SET name_grams = ?1 WHERE id = ?2")?;
+    let mut update = transaction.prepare("UPDATE files SET name_grams = ?1 WHERE id = ?2")?;
     for (id, name) in names {
         update.execute(params![grams(&name), id])?;
     }
     drop(update);
-    connection.execute_batch(
-        "DROP TABLE IF EXISTS file_grams;
-         CREATE VIRTUAL TABLE file_grams USING fts5(
+    transaction.execute_batch(
+        "CREATE VIRTUAL TABLE file_grams USING fts5(
              name_grams, tokenize='unicode61', content='files', content_rowid='id'
          );
          CREATE TRIGGER files_ai AFTER INSERT ON files BEGIN
@@ -489,7 +517,24 @@ fn migrate_name_index(connection: &Connection) -> Result<()> {
          END;
          INSERT INTO file_grams(file_grams) VALUES ('rebuild');",
     )?;
+    transaction.commit()?;
     Ok(())
+}
+
+fn table_columns(connection: &Connection, table: &str) -> Result<Vec<String>> {
+    Ok(connection
+        .prepare(&format!("PRAGMA table_info({table})"))?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+fn is_skippable_filesystem_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
+        )
+    })
 }
 
 fn remove_root(transaction: &Transaction<'_>, root: &str) -> Result<()> {
@@ -844,10 +889,26 @@ mod tests {
             )
             .unwrap();
         drop(connection);
-        let index = Index::open(&database).unwrap();
+        let mut index = Index::open(&database).unwrap();
         let results = index.search("report", 10).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].path, PathBuf::from("/root/report-dir"));
+        // The key regression: a migrated old `grams NOT NULL` table must now
+        // accept newly indexed entries instead of marking every path skipped.
+        let directory = std::env::temp_dir().join(format!(
+            "flashfind-post-migration-{}-{}",
+            std::process::id(),
+            unix_seconds(SystemTime::now()).unwrap_or_default()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("new-report.txt"), "x").unwrap();
+        assert_eq!(index.index_root(&directory).unwrap().skipped, 0);
+        assert!(index
+            .search("new-report", 10)
+            .unwrap()
+            .iter()
+            .any(|result| result.path.ends_with("new-report.txt")));
+        let _ = fs::remove_dir_all(directory);
         let _ = fs::remove_file(database);
     }
 
