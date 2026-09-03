@@ -127,6 +127,23 @@ TUI 和 `search` 会尝试连接服务；若不存在便在当前用户会话中
 
 具体服务清单刻意未由程序自动写入，以免未经确认修改用户的系统启动配置。
 
+### 升级后必须重启后台服务
+
+TUI/CLI 与 daemon 是两个独立进程。升级 `flashfind` 二进制不会替换已经监听在本机端口上的旧 daemon；新 TUI 会优先连接它，因此旧 daemon 也不会执行新版本的 SQLite/FTS migration。若升级后 `*` 或其他搜索结果明显过少，先确认版本并重启 daemon：
+
+```bash
+flashfind --version        # 应显示当前安装版本，例如 0.1.1
+flashfind roots            # 重启后核对每个 root 的实际条目数
+flashfind search '*' --limit 1000
+```
+
+- **systemd user service**：`systemctl --user restart flashfind`
+- **macOS LaunchAgent**：重新启动对应 LaunchAgent，或先停止其 `flashfind daemon` 进程。
+- **Windows Task Scheduler**：结束旧任务实例后重新运行任务。
+- **前台/自动拉起 daemon**：先退出旧 `flashfind daemon` 进程，再重新执行 `flashfind` 或 `flashfind daemon`。
+
+在 Linux/macOS 上，确认没有其他 FlashFind 会话后可使用 `pkill -f 'flashfind daemon'`；Windows PowerShell 可使用 `Get-Process flashfind | Stop-Process`。这些命令会同时影响同一用户运行的所有 FlashFind daemon/TUI，请先保存需要的终端操作。
+
 ## 测试
 
 ```bash
