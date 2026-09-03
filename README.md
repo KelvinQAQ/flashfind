@@ -129,7 +129,7 @@ TUI 和 `search` 会尝试连接服务；若不存在便在当前用户会话中
 
 ### 升级后必须重启后台服务
 
-TUI/CLI 与 daemon 是两个独立进程。升级 `flashfind` 二进制不会替换已经监听在本机端口上的旧 daemon；新 TUI 会优先连接它，因此旧 daemon 也不会执行新版本的 SQLite/FTS migration。若升级后 `*` 或其他搜索结果明显过少，先确认版本并重启 daemon：
+TUI/CLI 与 daemon 是两个独立进程。升级 `flashfind` 二进制不会替换已经监听在本机端口上的旧 daemon；旧 daemon 也不会执行新版本的 SQLite/FTS migration。自 `v0.1.2` 起，客户端会通过 IPC 协议协商识别这种状态并明确要求重启，而不会静默复用旧服务。使用更早版本时，若升级后 `*` 或其他搜索结果明显过少，先确认版本并重启 daemon：
 
 ```bash
 flashfind --version        # 应显示当前安装版本，例如 0.1.1

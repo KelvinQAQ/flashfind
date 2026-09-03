@@ -33,6 +33,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 const ADDRESS: &str = "127.0.0.1:35185";
+const IPC_PROTOCOL_VERSION: u16 = 2;
 const TUI_PAGE_SIZE: usize = 200;
 const CLI_DEFAULT_LIMIT: usize = 1_000;
 const MAX_SEARCH_LIMIT: usize = 10_000;
@@ -83,6 +84,7 @@ struct WireRequest {
 #[derive(Serialize, Deserialize)]
 enum Request {
     Ping,
+    Status,
     Search {
         query: String,
         offset: usize,
@@ -124,6 +126,7 @@ impl SearchReply {
 #[derive(Serialize, Deserialize)]
 enum Response {
     Pong,
+    Status { protocol: u16, version: String },
     Results(SearchReply),
     Ok(String),
     Error(String),
@@ -352,6 +355,10 @@ fn handle_client(mut stream: TcpStream, index: &Index, token: &str) -> Result<()
     }
     let response = match wire.request {
         Request::Ping => Response::Pong,
+        Request::Status => Response::Status {
+            protocol: IPC_PROTOCOL_VERSION,
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+        },
         Request::Search {
             query,
             offset,
@@ -424,8 +431,18 @@ fn ipc_token() -> Result<String> {
 }
 
 fn ensure_daemon() -> Result<()> {
-    if matches!(send_request(Request::Ping), Ok(Response::Pong)) {
-        return Ok(());
+    match send_request(Request::Status) {
+        Ok(Response::Status { protocol, .. }) if protocol == IPC_PROTOCOL_VERSION => return Ok(()),
+        Ok(Response::Status { protocol, version }) => {
+            bail!("FlashFind daemon protocol {protocol} (version {version}) is incompatible; restart the background daemon after upgrading")
+        }
+        // An old daemon does not recognize Status. Confirm it answers the
+        // legacy ping, then fail explicitly instead of trying to spawn a new
+        // daemon that cannot bind its already occupied local port.
+        _ if matches!(send_request(Request::Ping), Ok(Response::Pong)) => {
+            bail!("an older FlashFind daemon is still running; restart it so the current binary can migrate and use the new index")
+        }
+        _ => {}
     }
     let executable = std::env::current_exe().context("could not locate FlashFind executable")?;
     ProcessCommand::new(executable)
