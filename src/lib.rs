@@ -19,8 +19,8 @@ const APP_QUALIFIER: &str = "io";
 const APP_ORGANIZATION: &str = "FlashFind";
 const APP_NAME: &str = "FlashFind";
 const INSERT_SQL: &str = r#"
-    INSERT INTO files(path, path_folded, name, name_folded, name_grams, kind, size, modified, root)
-    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+    INSERT INTO files(path, name, name_folded, kind, size, modified, root)
+    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
 "#;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,8 +81,17 @@ pub struct SearchPage {
     pub has_more: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct DatabaseStats {
+    pub database_bytes: u64,
+    pub wal_bytes: u64,
+    pub free_pages: u64,
+    pub page_count: u64,
+}
+
 pub struct Index {
     connection: Connection,
+    database_path: PathBuf,
 }
 
 impl Index {
@@ -97,7 +106,9 @@ impl Index {
     }
 
     pub fn open(database: impl AsRef<Path>) -> Result<Self> {
-        let mut connection = Connection::open(database).context("could not open SQLite index")?;
+        let database_path = database.as_ref().to_path_buf();
+        let mut connection =
+            Connection::open(&database_path).context("could not open SQLite index")?;
         connection
             .pragma_update(None, "journal_mode", "WAL")
             .context("could not enable SQLite WAL mode")?;
@@ -111,10 +122,8 @@ impl Index {
             CREATE TABLE IF NOT EXISTS files (
                 id          INTEGER PRIMARY KEY,
                 path        TEXT NOT NULL UNIQUE,
-                path_folded TEXT NOT NULL,
                 name        TEXT NOT NULL,
                 name_folded TEXT NOT NULL,
-                name_grams  TEXT NOT NULL,
                 kind        TEXT NOT NULL,
                 size        INTEGER NOT NULL,
                 modified    INTEGER,
@@ -125,24 +134,26 @@ impl Index {
                 added        INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS files_root ON files(root);
-            CREATE INDEX IF NOT EXISTS files_name_folded ON files(name_folded);
             CREATE VIRTUAL TABLE IF NOT EXISTS file_grams USING fts5(
-                name_grams, tokenize='unicode61', content='files', content_rowid='id'
+                name_folded, tokenize='trigram', content='files', content_rowid='id'
             );
             CREATE TRIGGER IF NOT EXISTS files_ai AFTER INSERT ON files BEGIN
-                INSERT INTO file_grams(rowid, name_grams) VALUES (new.id, new.name_grams);
+                INSERT INTO file_grams(rowid, name_folded) VALUES (new.id, new.name_folded);
             END;
             CREATE TRIGGER IF NOT EXISTS files_ad AFTER DELETE ON files BEGIN
-                INSERT INTO file_grams(file_grams, rowid, name_grams) VALUES ('delete', old.id, old.name_grams);
+                INSERT INTO file_grams(file_grams, rowid, name_folded) VALUES ('delete', old.id, old.name_folded);
             END;
             CREATE TRIGGER IF NOT EXISTS files_au AFTER UPDATE ON files BEGIN
-                INSERT INTO file_grams(file_grams, rowid, name_grams) VALUES ('delete', old.id, old.name_grams);
-                INSERT INTO file_grams(rowid, name_grams) VALUES (new.id, new.name_grams);
+                INSERT INTO file_grams(file_grams, rowid, name_folded) VALUES ('delete', old.id, old.name_folded);
+                INSERT INTO file_grams(rowid, name_folded) VALUES (new.id, new.name_folded);
             END;
             "#,
         )?;
-        migrate_name_index(&mut connection)?;
-        Ok(Self { connection })
+        migrate_compact_schema(&mut connection)?;
+        Ok(Self {
+            connection,
+            database_path,
+        })
     }
 
     /// Rebuilds one root atomically. Traversal uses `ignore`'s parallel walker;
@@ -206,6 +217,12 @@ impl Index {
             }
         }
         transaction.commit()?;
+        // Large root replacement can grow WAL close to the database size.
+        // PASSIVE checkpoint never blocks active readers and caps long-term
+        // disk growth; explicit maintenance can later truncate the file.
+        let _ = self
+            .connection
+            .execute_batch("PRAGMA wal_checkpoint(PASSIVE)");
         Ok(stats)
     }
 
@@ -257,13 +274,15 @@ impl Index {
         let mut candidates = Vec::new();
         if literal.chars().count() >= 3 {
             let mut statement = self.connection.prepare(
-                "SELECT f.path, f.kind, f.size, f.modified, f.name_folded, f.path_folded
+                "SELECT f.path, f.kind, f.size, f.modified, f.name_folded, f.name_folded
                  FROM file_grams g JOIN files f ON f.id = g.rowid
-                 WHERE g.name_grams MATCH ?1
+                 WHERE g.name_folded MATCH ?1
                  LIMIT ?2",
             )?;
-            let rows =
-                statement.query_map(params![grams(&literal), candidate_limit], row_from_query)?;
+            let rows = statement.query_map(
+                params![fts_phrase(&literal), candidate_limit],
+                row_from_query,
+            )?;
             for row in rows {
                 candidates.push(row?);
             }
@@ -273,7 +292,7 @@ impl Index {
             // candidate set; the asynchronous TUI keeps this off the UI thread.
             let pattern = like_contains_pattern(&literal);
             let mut statement = self.connection.prepare(
-                "SELECT path, kind, size, modified, name_folded, path_folded FROM files
+                "SELECT path, kind, size, modified, name_folded, name_folded FROM files
                  WHERE name_folded LIKE ?1 ESCAPE '\\'
                  LIMIT ?2",
             )?;
@@ -287,7 +306,7 @@ impl Index {
             let (question_marks, has_star) = pure_glob_shape(&query).expect("query has no literal");
             let operator = if has_star { ">=" } else { "=" };
             let sql = format!(
-                "SELECT path, kind, size, modified, name_folded, path_folded FROM files
+                "SELECT path, kind, size, modified, name_folded, name_folded FROM files
                  WHERE length(name_folded) {operator} ?1
                  LIMIT ?2"
             );
@@ -313,6 +332,43 @@ impl Index {
             .take(limit)
             .map(search_result)
             .collect())
+    }
+
+    pub fn database_stats(&self) -> Result<DatabaseStats> {
+        let database_bytes = fs::metadata(&self.database_path)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        let wal_path = PathBuf::from(format!("{}-wal", self.database_path.display()));
+        let wal_bytes = fs::metadata(wal_path).map(|meta| meta.len()).unwrap_or(0);
+        Ok(DatabaseStats {
+            database_bytes,
+            wal_bytes,
+            free_pages: self
+                .connection
+                .query_row("PRAGMA freelist_count", [], |row| row.get(0))?,
+            page_count: self
+                .connection
+                .query_row("PRAGMA page_count", [], |row| row.get(0))?,
+        })
+    }
+
+    /// Safely folds committed WAL pages into the main database and truncates
+    /// the WAL if no reader holds an old snapshot.
+    pub fn checkpoint(&self) -> Result<DatabaseStats> {
+        let _: (i64, i64, i64) =
+            self.connection
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?;
+        self.database_stats()
+    }
+
+    /// Rewrites the database into a dense file. Call only while the daemon is
+    /// stopped; SQLite VACUUM requires an exclusive write lock.
+    pub fn compact(&self) -> Result<DatabaseStats> {
+        self.checkpoint()?;
+        self.connection.execute_batch("VACUUM")?;
+        self.checkpoint()
     }
 
     pub fn indexed_roots(&self) -> Result<Vec<PathBuf>> {
@@ -439,81 +495,56 @@ pub fn default_roots() -> Result<Vec<PathBuf>> {
     Ok(vec![home.home_dir().to_path_buf()])
 }
 
-/// Migrates every pre-name-search schema to the current name-only layout.
-///
-/// Some old databases retain `files.grams TEXT NOT NULL`. Simply adding
-/// `name_grams` leaves this legacy constraint in place, so modern inserts fail
-/// before triggers run. Rebuild the table transactionally to remove it, then
-/// rebuild FTS from names.
-fn migrate_name_index(connection: &mut Connection) -> Result<()> {
-    let file_columns = table_columns(connection, "files")?;
-    let has_legacy_grams = file_columns.iter().any(|column| column == "grams");
-    let has_name_grams = file_columns.iter().any(|column| column == "name_grams");
+/// Rebuilds prior schemas into the compact name-only layout. This removes the
+/// obsolete path-folded copy and explicit hex trigram text without weakening
+/// substring lookup: FTS5's native trigram tokenizer indexes name_folded.
+fn migrate_compact_schema(connection: &mut Connection) -> Result<()> {
+    let columns = table_columns(connection, "files")?;
     let fts_is_current = table_columns(connection, "file_grams")?
         .iter()
-        .any(|column| column == "name_grams");
-    if !has_legacy_grams && has_name_grams && fts_is_current {
+        .any(|column| column == "name_folded");
+    let files_are_current = columns
+        == [
+            "id",
+            "path",
+            "name",
+            "name_folded",
+            "kind",
+            "size",
+            "modified",
+            "root",
+        ];
+    if files_are_current && fts_is_current {
         return Ok(());
     }
-
     let transaction = connection.transaction()?;
     transaction.execute_batch(
         "DROP TRIGGER IF EXISTS files_ai;
          DROP TRIGGER IF EXISTS files_ad;
          DROP TRIGGER IF EXISTS files_au;
-         DROP TABLE IF EXISTS file_grams;",
-    )?;
-    if has_legacy_grams {
-        transaction.execute_batch(
-            "CREATE TABLE files_current (
-                id          INTEGER PRIMARY KEY,
-                path        TEXT NOT NULL UNIQUE,
-                path_folded TEXT NOT NULL,
-                name        TEXT NOT NULL,
-                name_folded TEXT NOT NULL,
-                name_grams  TEXT NOT NULL,
-                kind        TEXT NOT NULL,
-                size        INTEGER NOT NULL,
-                modified    INTEGER,
-                root        TEXT NOT NULL
-            );
-            INSERT INTO files_current(id, path, path_folded, name, name_folded, name_grams, kind, size, modified, root)
-            SELECT id, path, path_folded, name, name_folded, '', kind, size, modified, root FROM files;
-            DROP TABLE files;
-            ALTER TABLE files_current RENAME TO files;
-            CREATE INDEX files_root ON files(root);
-            CREATE INDEX files_name_folded ON files(name_folded);",
-        )?;
-    } else if !has_name_grams {
-        transaction.execute(
-            "ALTER TABLE files ADD COLUMN name_grams TEXT NOT NULL DEFAULT ''",
-            [],
-        )?;
-    }
-    let names = transaction
-        .prepare("SELECT id, name_folded FROM files")?
-        .query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut update = transaction.prepare("UPDATE files SET name_grams = ?1 WHERE id = ?2")?;
-    for (id, name) in names {
-        update.execute(params![grams(&name), id])?;
-    }
-    drop(update);
-    transaction.execute_batch(
-        "CREATE VIRTUAL TABLE file_grams USING fts5(
-             name_grams, tokenize='unicode61', content='files', content_rowid='id'
+         DROP TABLE IF EXISTS file_grams;
+         CREATE TABLE files_current (
+            id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
+            name_folded TEXT NOT NULL, kind TEXT NOT NULL, size INTEGER NOT NULL,
+            modified INTEGER, root TEXT NOT NULL
+         );
+         INSERT INTO files_current(id, path, name, name_folded, kind, size, modified, root)
+         SELECT id, path, name, name_folded, kind, size, modified, root FROM files;
+         DROP TABLE files;
+         ALTER TABLE files_current RENAME TO files;
+         CREATE INDEX files_root ON files(root);
+         CREATE VIRTUAL TABLE file_grams USING fts5(
+            name_folded, tokenize='trigram', content='files', content_rowid='id'
          );
          CREATE TRIGGER files_ai AFTER INSERT ON files BEGIN
-             INSERT INTO file_grams(rowid, name_grams) VALUES (new.id, new.name_grams);
+            INSERT INTO file_grams(rowid, name_folded) VALUES (new.id, new.name_folded);
          END;
          CREATE TRIGGER files_ad AFTER DELETE ON files BEGIN
-             INSERT INTO file_grams(file_grams, rowid, name_grams) VALUES ('delete', old.id, old.name_grams);
+            INSERT INTO file_grams(file_grams, rowid, name_folded) VALUES ('delete', old.id, old.name_folded);
          END;
          CREATE TRIGGER files_au AFTER UPDATE ON files BEGIN
-             INSERT INTO file_grams(file_grams, rowid, name_grams) VALUES ('delete', old.id, old.name_grams);
-             INSERT INTO file_grams(rowid, name_grams) VALUES (new.id, new.name_grams);
+            INSERT INTO file_grams(file_grams, rowid, name_folded) VALUES ('delete', old.id, old.name_folded);
+            INSERT INTO file_grams(rowid, name_folded) VALUES (new.id, new.name_folded);
          END;
          INSERT INTO file_grams(file_grams) VALUES ('rebuild');",
     )?;
@@ -570,10 +601,8 @@ fn insert_path(
     let modified = metadata.modified().ok().and_then(unix_seconds);
     statement.execute(params![
         path,
-        fold(&path),
         name,
         fold(&name),
-        grams(&fold(&name)),
         kind.as_str(),
         metadata.len() as i64,
         modified,
@@ -618,6 +647,11 @@ fn longest_literal(pattern: &str) -> String {
         .max_by_key(|fragment| fragment.chars().count())
         .unwrap_or_default()
         .to_owned()
+}
+
+/// Escapes an FTS5 phrase so punctuation in a filename is treated literally.
+fn fts_phrase(literal: &str) -> String {
+    format!("\"{}\"", literal.replace('"', "\"\""))
 }
 
 fn like_contains_pattern(literal: &str) -> String {
@@ -748,6 +782,7 @@ fn fold(value: &str) -> String {
     value.to_lowercase()
 }
 
+#[cfg(test)]
 /// Generates overlapping Unicode-character trigrams as safe ASCII FTS tokens.
 /// FTS intersects all tokens, producing a compact candidate set; Rust then
 /// verifies the exact substring. Hex encoding keeps separators and CJK valid
@@ -767,6 +802,7 @@ fn grams(value: &str) -> String {
         .join(" ")
 }
 
+#[cfg(test)]
 fn hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len() * 2);

@@ -73,6 +73,18 @@ enum Command {
     },
     /// Show roots registered for background indexing.
     Roots,
+    /// Inspect or reduce local SQLite storage. Compact requires daemon stopped.
+    Maintenance {
+        #[command(subcommand)]
+        action: MaintenanceAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum MaintenanceAction {
+    Stats,
+    Checkpoint,
+    Compact,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -199,6 +211,23 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Maintenance { action } => {
+            let index = Index::open_default()?;
+            let stats = match action {
+                MaintenanceAction::Stats => index.database_stats()?,
+                MaintenanceAction::Checkpoint => index.checkpoint()?,
+                MaintenanceAction::Compact => {
+                    if TcpStream::connect_timeout(&ADDRESS.parse()?, Duration::from_millis(100))
+                        .is_ok()
+                    {
+                        bail!("stop the FlashFind daemon before compacting: VACUUM requires exclusive database access")
+                    }
+                    index.compact()?
+                }
+            };
+            print_database_stats(&stats);
+            Ok(())
+        }
     }
 }
 
@@ -279,10 +308,23 @@ fn index_writer(mut roots: Vec<PathBuf>) -> Result<()> {
         }
         watcher.watch(root, RecursiveMode::Recursive)?;
     }
-    for root in &roots {
+    let empty_roots = index
+        .root_summaries()?
+        .into_iter()
+        .filter(|root| root.entries == 0)
+        .map(|root| root.path)
+        .collect::<Vec<_>>();
+    for root in empty_roots {
         if root.is_dir() {
-            match index.index_root(root) {
-                Ok(stats) => eprintln!("indexed {} ({} entries)", root.display(), stats.indexed),
+            match index.index_root(&root) {
+                Ok(stats) => {
+                    eprintln!(
+                        "initially indexed {} ({} entries)",
+                        root.display(),
+                        stats.indexed
+                    );
+                    let _ = index.checkpoint();
+                }
                 Err(error) => eprintln!("could not index {}: {error:#}", root.display()),
             }
         }
@@ -302,7 +344,8 @@ fn index_writer(mut roots: Vec<PathBuf>) -> Result<()> {
                     watcher.watch(&root, RecursiveMode::Recursive)?;
                     match index.index_root(&root) {
                         Ok(stats) => {
-                            eprintln!("added root {} ({} entries)", root.display(), stats.indexed)
+                            eprintln!("added root {} ({} entries)", root.display(), stats.indexed);
+                            let _ = index.checkpoint();
                         }
                         Err(error) => eprintln!("could not add root {}: {error:#}", root.display()),
                     }
@@ -412,6 +455,26 @@ fn send_request(request: Request) -> Result<Response> {
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line)?;
     Ok(serde_json::from_str(&line)?)
+}
+
+fn print_database_stats(stats: &flashfind::DatabaseStats) {
+    println!("database: {}", format_bytes(stats.database_bytes));
+    println!("wal:      {}", format_bytes(stats.wal_bytes));
+    println!("pages:    {} (free {})", stats.page_count, stats.free_pages);
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "MiB", "GiB", "TiB"];
+    if bytes < 1024 * 1024 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64 / (1024.0 * 1024.0);
+    let mut unit = 1;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
 }
 
 fn ipc_token() -> Result<String> {
