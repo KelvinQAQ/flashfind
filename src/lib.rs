@@ -19,7 +19,7 @@ const APP_QUALIFIER: &str = "io";
 const APP_ORGANIZATION: &str = "FlashFind";
 const APP_NAME: &str = "FlashFind";
 const INSERT_SQL: &str = r#"
-    INSERT INTO files(path, path_folded, name, name_folded, grams, kind, size, modified, root)
+    INSERT INTO files(path, path_folded, name, name_folded, name_grams, kind, size, modified, root)
     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
 "#;
 
@@ -114,7 +114,7 @@ impl Index {
                 path_folded TEXT NOT NULL,
                 name        TEXT NOT NULL,
                 name_folded TEXT NOT NULL,
-                grams       TEXT NOT NULL,
+                name_grams  TEXT NOT NULL,
                 kind        TEXT NOT NULL,
                 size        INTEGER NOT NULL,
                 modified    INTEGER,
@@ -127,20 +127,21 @@ impl Index {
             CREATE INDEX IF NOT EXISTS files_root ON files(root);
             CREATE INDEX IF NOT EXISTS files_name_folded ON files(name_folded);
             CREATE VIRTUAL TABLE IF NOT EXISTS file_grams USING fts5(
-                grams, tokenize='unicode61', content='files', content_rowid='id'
+                name_grams, tokenize='unicode61', content='files', content_rowid='id'
             );
             CREATE TRIGGER IF NOT EXISTS files_ai AFTER INSERT ON files BEGIN
-                INSERT INTO file_grams(rowid, grams) VALUES (new.id, new.grams);
+                INSERT INTO file_grams(rowid, name_grams) VALUES (new.id, new.name_grams);
             END;
             CREATE TRIGGER IF NOT EXISTS files_ad AFTER DELETE ON files BEGIN
-                INSERT INTO file_grams(file_grams, rowid, grams) VALUES ('delete', old.id, old.grams);
+                INSERT INTO file_grams(file_grams, rowid, name_grams) VALUES ('delete', old.id, old.name_grams);
             END;
             CREATE TRIGGER IF NOT EXISTS files_au AFTER UPDATE ON files BEGIN
-                INSERT INTO file_grams(file_grams, rowid, grams) VALUES ('delete', old.id, old.grams);
-                INSERT INTO file_grams(rowid, grams) VALUES (new.id, new.grams);
+                INSERT INTO file_grams(file_grams, rowid, name_grams) VALUES ('delete', old.id, old.name_grams);
+                INSERT INTO file_grams(rowid, name_grams) VALUES (new.id, new.name_grams);
             END;
             "#,
         )?;
+        migrate_name_index(&connection)?;
         Ok(Self { connection })
     }
 
@@ -248,7 +249,7 @@ impl Index {
             let mut statement = self.connection.prepare(
                 "SELECT f.path, f.kind, f.size, f.modified, f.name_folded, f.path_folded
                  FROM file_grams g JOIN files f ON f.id = g.rowid
-                 WHERE g.grams MATCH ?1
+                 WHERE g.name_grams MATCH ?1
                  LIMIT ?2",
             )?;
             let rows =
@@ -263,7 +264,7 @@ impl Index {
             let pattern = like_contains_pattern(&literal);
             let mut statement = self.connection.prepare(
                 "SELECT path, kind, size, modified, name_folded, path_folded FROM files
-                 WHERE name_folded LIKE ?1 ESCAPE '\\' OR path_folded LIKE ?1 ESCAPE '\\'
+                 WHERE name_folded LIKE ?1 ESCAPE '\\'
                  LIMIT ?2",
             )?;
             let rows = statement.query_map(params![pattern, candidate_limit], row_from_query)?;
@@ -277,7 +278,7 @@ impl Index {
             let operator = if has_star { ">=" } else { "=" };
             let sql = format!(
                 "SELECT path, kind, size, modified, name_folded, path_folded FROM files
-                 WHERE length(name_folded) {operator} ?1 OR length(path_folded) {operator} ?1
+                 WHERE length(name_folded) {operator} ?1
                  LIMIT ?2"
             );
             let mut statement = self.connection.prepare(&sql)?;
@@ -292,15 +293,11 @@ impl Index {
         let compiled_glob = query
             .contains(['*', '?'])
             .then(|| query.chars().collect::<Vec<_>>());
-        candidates.retain(|(_, _, _, _, name, path)| match &compiled_glob {
-            Some(pattern) => {
-                glob_matches_compiled(pattern, name) || glob_matches_compiled(pattern, path)
-            }
-            None => name.contains(&query) || path.contains(&query),
+        candidates.retain(|(_, _, _, _, name, _)| match &compiled_glob {
+            Some(pattern) => glob_matches_compiled(pattern, name),
+            None => name.contains(&query),
         });
-        candidates.sort_by_key(|candidate| {
-            std::cmp::Reverse(score(&literal, &candidate.4, &candidate.5))
-        });
+        candidates.sort_by_key(|candidate| std::cmp::Reverse(score(&literal, &candidate.4)));
         Ok(candidates
             .into_iter()
             .take(limit)
@@ -432,6 +429,69 @@ pub fn default_roots() -> Result<Vec<PathBuf>> {
     Ok(vec![home.home_dir().to_path_buf()])
 }
 
+/// Migrates the pre-name-search database layout. The old layout stored path
+/// trigrams in `files.grams`; retaining it would incorrectly let a directory
+/// name match every descendant. Rebuilding FTS from `name_grams` is fast and
+/// atomic at SQLite level; filesystem entries themselves are not re-walked.
+fn migrate_name_index(connection: &Connection) -> Result<()> {
+    let file_columns = connection
+        .prepare("PRAGMA table_info(files)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let has_name_grams = file_columns.iter().any(|column| column == "name_grams");
+    // A short-lived development layout had `files.name_grams` but retained an
+    // FTS column named `grams`. Check both schemas; checking only the table
+    // field would leave that index unusable and make broad queries look empty.
+    let fts_columns = connection
+        .prepare("PRAGMA table_info(file_grams)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let fts_is_current = fts_columns.iter().any(|column| column == "name_grams");
+    if has_name_grams && fts_is_current {
+        return Ok(());
+    }
+    connection.execute_batch(
+        "DROP TRIGGER IF EXISTS files_ai;
+         DROP TRIGGER IF EXISTS files_ad;
+         DROP TRIGGER IF EXISTS files_au;",
+    )?;
+    if !has_name_grams {
+        connection.execute(
+            "ALTER TABLE files ADD COLUMN name_grams TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+    let names = connection
+        .prepare("SELECT id, name_folded FROM files")?
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut update = connection.prepare("UPDATE files SET name_grams = ?1 WHERE id = ?2")?;
+    for (id, name) in names {
+        update.execute(params![grams(&name), id])?;
+    }
+    drop(update);
+    connection.execute_batch(
+        "DROP TABLE IF EXISTS file_grams;
+         CREATE VIRTUAL TABLE file_grams USING fts5(
+             name_grams, tokenize='unicode61', content='files', content_rowid='id'
+         );
+         CREATE TRIGGER files_ai AFTER INSERT ON files BEGIN
+             INSERT INTO file_grams(rowid, name_grams) VALUES (new.id, new.name_grams);
+         END;
+         CREATE TRIGGER files_ad AFTER DELETE ON files BEGIN
+             INSERT INTO file_grams(file_grams, rowid, name_grams) VALUES ('delete', old.id, old.name_grams);
+         END;
+         CREATE TRIGGER files_au AFTER UPDATE ON files BEGIN
+             INSERT INTO file_grams(file_grams, rowid, name_grams) VALUES ('delete', old.id, old.name_grams);
+             INSERT INTO file_grams(rowid, name_grams) VALUES (new.id, new.name_grams);
+         END;
+         INSERT INTO file_grams(file_grams) VALUES ('rebuild');",
+    )?;
+    Ok(())
+}
+
 fn remove_root(transaction: &Transaction<'_>, root: &str) -> Result<()> {
     transaction.execute("DELETE FROM files WHERE root = ?1", [root])?;
     Ok(())
@@ -468,7 +528,7 @@ fn insert_path(
         fold(&path),
         name,
         fold(&name),
-        grams(&fold(&path)),
+        grams(&fold(&name)),
         kind.as_str(),
         metadata.len() as i64,
         modified,
@@ -568,14 +628,12 @@ fn glob_matches_compiled(pattern: &[char], value: &str) -> bool {
     pattern_index == pattern.len()
 }
 
-fn score(query: &str, name: &str, path: &str) -> u8 {
+fn score(query: &str, name: &str) -> u8 {
     if name == query {
-        4
-    } else if name.starts_with(query) {
         3
-    } else if name.contains(query) {
+    } else if name.starts_with(query) {
         2
-    } else if path.ends_with(query) {
+    } else if name.contains(query) {
         1
     } else {
         0
@@ -735,6 +793,96 @@ mod tests {
     }
 
     #[test]
+    fn migrates_old_path_gram_index_to_name_only_index() {
+        let database = std::env::temp_dir().join(format!(
+            "flashfind-migration-test-{}-{}.sqlite",
+            std::process::id(),
+            unix_seconds(SystemTime::now()).unwrap_or_default()
+        ));
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE files (
+                id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE, path_folded TEXT NOT NULL,
+                name TEXT NOT NULL, name_folded TEXT NOT NULL, grams TEXT NOT NULL,
+                kind TEXT NOT NULL, size INTEGER NOT NULL, modified INTEGER, root TEXT NOT NULL
+            );
+            CREATE VIRTUAL TABLE file_grams USING fts5(
+                grams, tokenize='unicode61', content='files', content_rowid='id'
+            );
+            CREATE TRIGGER files_ai AFTER INSERT ON files BEGIN
+                INSERT INTO file_grams(rowid, grams) VALUES (new.id, new.grams);
+            END;",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO files(path, path_folded, name, name_folded, grams, kind, size, root)
+             VALUES(?1, ?2, ?3, ?4, ?5, 'directory', 0, ?6)",
+                params![
+                    "/root/report-dir",
+                    "/root/report-dir",
+                    "report-dir",
+                    "report-dir",
+                    grams("/root/report-dir"),
+                    "/root"
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO files(path, path_folded, name, name_folded, grams, kind, size, root)
+             VALUES(?1, ?2, ?3, ?4, ?5, 'file', 0, ?6)",
+                params![
+                    "/root/report-dir/unrelated.txt",
+                    "/root/report-dir/unrelated.txt",
+                    "unrelated.txt",
+                    "unrelated.txt",
+                    grams("/root/report-dir/unrelated.txt"),
+                    "/root"
+                ],
+            )
+            .unwrap();
+        drop(connection);
+        let index = Index::open(&database).unwrap();
+        let results = index.search("report", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].path, PathBuf::from("/root/report-dir"));
+        let _ = fs::remove_file(database);
+    }
+
+    #[test]
+    fn migrates_transitional_name_column_with_old_fts_column() {
+        let database = std::env::temp_dir().join(format!(
+            "flashfind-transition-test-{}-{}.sqlite",
+            std::process::id(),
+            unix_seconds(SystemTime::now()).unwrap_or_default()
+        ));
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE files (
+                id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE, path_folded TEXT NOT NULL,
+                name TEXT NOT NULL, name_folded TEXT NOT NULL, name_grams TEXT NOT NULL,
+                kind TEXT NOT NULL, size INTEGER NOT NULL, modified INTEGER, root TEXT NOT NULL
+            );
+            CREATE VIRTUAL TABLE file_grams USING fts5(
+                grams, tokenize='unicode61', content='files', content_rowid='id'
+            );",
+            )
+            .unwrap();
+        connection.execute(
+            "INSERT INTO files(path, path_folded, name, name_folded, name_grams, kind, size, root)
+             VALUES(?1, ?2, ?3, ?4, ?5, 'file', 0, ?6)",
+            params!["/root/needle.txt", "/root/needle.txt", "needle.txt", "needle.txt", grams("needle.txt"), "/root"],
+        ).unwrap();
+        drop(connection);
+        let index = Index::open(&database).unwrap();
+        assert_eq!(index.search("needle", 10).unwrap().len(), 1);
+        let _ = fs::remove_file(database);
+    }
+
+    #[test]
     fn pages_results_and_reports_root_entry_count() {
         let mut index = Index::open(":memory:").unwrap();
         let dir = std::env::temp_dir().join(format!(
@@ -766,6 +914,8 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("Résumé-Report.txt"), "x").unwrap();
         fs::write(dir.join("项目报告.md"), "x").unwrap();
+        fs::create_dir_all(dir.join("report-directory")).unwrap();
+        fs::write(dir.join("report-directory").join("unrelated.txt"), "x").unwrap();
         index.index_root(&dir).unwrap();
         assert!(index
             .search("report", 10)
@@ -782,6 +932,9 @@ mod tests {
             .unwrap()
             .iter()
             .any(|result| result.path.ends_with("Résumé-Report.txt")));
+        let directory_matches = index.search("report-directory", 10).unwrap();
+        assert_eq!(directory_matches.len(), 1);
+        assert!(directory_matches[0].path.ends_with("report-directory"));
         let _ = fs::remove_dir_all(dir);
     }
 }

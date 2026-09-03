@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+use chrono::{Local, TimeZone};
 use clap::{Parser, Subcommand};
 use crossterm::{
     event::DisableBracketedPaste,
@@ -171,7 +172,7 @@ fn main() -> Result<()> {
                 Response::Results(page) => {
                     let page = page.into_page();
                     for result in page.results {
-                        println!("{:<9} {}", kind_label(&result.kind), result.path.display());
+                        println!("{}  {}", kind_code(&result.kind), result.path.display());
                     }
                     if page.has_more {
                         eprintln!(
@@ -820,6 +821,24 @@ fn highlight_literals(query: &str) -> Vec<Vec<char>> {
     literals
 }
 
+/// The query applies to the leaf name. Render the full path, but do not
+/// highlight an identical word in a parent directory, which would suggest a
+/// path-match that the search engine intentionally does not perform.
+fn highlighted_path_spans(path: &str, literals: &[Vec<char>]) -> Vec<Span<'static>> {
+    let separator = std::path::MAIN_SEPARATOR;
+    match path.rfind(separator) {
+        Some(offset) => {
+            let mut spans = vec![Span::raw(path[..=offset].to_owned())];
+            spans.extend(highlighted_spans(
+                &path[offset + separator.len_utf8()..],
+                literals,
+            ));
+            spans
+        }
+        None => highlighted_spans(path, literals),
+    }
+}
+
 fn highlighted_spans(value: &str, literals: &[Vec<char>]) -> Vec<Span<'static>> {
     let characters = value.chars().collect::<Vec<_>>();
     let mut mask = vec![false; characters.len()];
@@ -860,6 +879,143 @@ fn highlighted_spans(value: &str, literals: &[Vec<char>]) -> Vec<Span<'static>> 
         start = end;
     }
     spans
+}
+
+#[derive(Clone, Copy)]
+struct ResultColumns {
+    name_width: usize,
+    show_size: bool,
+    show_modified: bool,
+}
+
+impl ResultColumns {
+    fn for_width(width: usize) -> Self {
+        // `D  ` consumes three cells. Optional data is separated by exactly
+        // two cells: `D  <path>  <size:>8  <timestamp:19>`.
+        // Keep at least 13 cells for the full path before showing all metadata.
+        if width >= 48 {
+            Self {
+                name_width: width - 35,
+                show_size: true,
+                show_modified: true,
+            }
+        } else if width >= 24 {
+            Self {
+                name_width: width - 13,
+                show_size: true,
+                show_modified: false,
+            }
+        } else {
+            Self {
+                name_width: width.saturating_sub(3).max(1),
+                show_size: false,
+                show_modified: false,
+            }
+        }
+    }
+}
+
+fn result_item(
+    result: &SearchResult,
+    highlights: &[Vec<char>],
+    columns: ResultColumns,
+) -> ListItem<'static> {
+    let path = result.path.to_string_lossy().into_owned();
+    let path = middle_ellipsis(&path, columns.name_width);
+    let mut spans = vec![Span::styled(
+        format!("{}  ", kind_code(&result.kind)),
+        Style::default().fg(Color::Cyan),
+    )];
+    spans.extend(highlighted_path_spans(&path, highlights));
+    let padding = columns
+        .name_width
+        .saturating_sub(UnicodeWidthStr::width(path.as_str()));
+    spans.push(Span::raw(" ".repeat(padding)));
+    if columns.show_size {
+        spans.push(Span::styled(
+            format!("  {:>8}", format_size(result)),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    if columns.show_modified {
+        spans.push(Span::styled(
+            format!("  {}", format_modified(result.modified)),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    ListItem::new(Line::from(spans))
+}
+
+fn kind_code(kind: &Kind) -> char {
+    if matches!(kind, Kind::Directory) {
+        'D'
+    } else {
+        'F'
+    }
+}
+
+fn format_size(result: &SearchResult) -> String {
+    if matches!(result.kind, Kind::Directory) {
+        return "-".into();
+    }
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = result.size as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} B", result.size)
+    } else if value >= 10.0 {
+        format!("{value:.0} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn format_modified(modified: Option<i64>) -> String {
+    modified
+        .and_then(|seconds| Local.timestamp_opt(seconds, 0).single())
+        .map(|time| time.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|| "-".into())
+}
+
+/// Fits a display string by retaining both ends. Paths/names often carry their
+/// useful extension or suffix at the end, so `…` is better than tail-only trim.
+fn middle_ellipsis(text: &str, max_width: usize) -> String {
+    if UnicodeWidthStr::width(text) <= max_width {
+        return text.to_owned();
+    }
+    if max_width <= 1 {
+        return "…".into();
+    }
+    let budget = max_width - 1;
+    let left_budget = budget.div_ceil(2);
+    let right_budget = budget / 2;
+    let graphemes = text.graphemes(true).collect::<Vec<_>>();
+    let mut left = String::new();
+    let mut left_width = 0;
+    for grapheme in &graphemes {
+        let width = UnicodeWidthStr::width(*grapheme);
+        if left_width + width > left_budget {
+            break;
+        }
+        left.push_str(grapheme);
+        left_width += width;
+    }
+    let mut right_parts = Vec::new();
+    let mut right_width = 0;
+    for grapheme in graphemes.iter().rev() {
+        let width = UnicodeWidthStr::width(*grapheme);
+        if right_width + width > right_budget {
+            break;
+        }
+        right_parts.push(*grapheme);
+        right_width += width;
+    }
+    right_parts.reverse();
+    format!("{left}…{}", right_parts.concat())
 }
 
 fn operate(app: &mut App, build: impl FnOnce(String) -> Request) {
@@ -904,20 +1060,11 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
         chunks[0],
     );
     let highlights = highlight_literals(&app.query);
+    let columns = ResultColumns::for_width(chunks[1].width.saturating_sub(2) as usize);
     let items = app
         .results
         .iter()
-        .map(|result| {
-            let mut spans = vec![Span::styled(
-                format!("{:<9}", kind_label(&result.kind)),
-                Style::default().fg(Color::Cyan),
-            )];
-            spans.extend(highlighted_spans(
-                &result.path.to_string_lossy(),
-                &highlights,
-            ));
-            ListItem::new(Line::from(spans))
-        })
+        .map(|result| result_item(result, &highlights, columns))
         .collect::<Vec<_>>();
     let mut state = ListState::default();
     if !app.results.is_empty() {
@@ -925,7 +1072,7 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
     }
     frame.render_stateful_widget(
         List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(" 结果 "))
+            .block(Block::default().borders(Borders::ALL))
             .highlight_style(
                 Style::default()
                     .bg(Color::DarkGray)
@@ -980,15 +1127,6 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         .split(vertical[1])[1]
 }
 
-fn kind_label(kind: &Kind) -> &'static str {
-    match kind {
-        Kind::File => "file",
-        Kind::Directory => "directory",
-        Kind::Symlink => "symlink",
-        Kind::Other => "other",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1017,6 +1155,39 @@ mod tests {
         assert_eq!(app.query, "jkq中文");
         handle_key(&mut app, KeyCode::Backspace, KeyModifiers::NONE).unwrap();
         assert_eq!(app.query, "jkq中");
+    }
+
+    #[test]
+    fn result_columns_drop_metadata_before_filename() {
+        let wide = ResultColumns::for_width(80);
+        assert!(wide.show_size && wide.show_modified);
+        let medium = ResultColumns::for_width(40);
+        assert!(medium.show_size && !medium.show_modified);
+        let narrow = ResultColumns::for_width(15);
+        assert!(!narrow.show_size && !narrow.show_modified);
+        assert_eq!(
+            middle_ellipsis("very-long-report-name.txt", 12),
+            "very-l…e.txt"
+        );
+    }
+
+    #[test]
+    fn formats_compact_metadata() {
+        let file = SearchResult {
+            path: PathBuf::from("report.txt"),
+            kind: Kind::File,
+            size: 1_572_864,
+            modified: Some(0),
+        };
+        assert_eq!(format_size(&file), "1.5 MiB");
+        let modified = format_modified(file.modified);
+        assert_eq!(modified.len(), 19);
+        assert!(modified.starts_with("1970-01-01"));
+        let directory = SearchResult {
+            kind: Kind::Directory,
+            ..file
+        };
+        assert_eq!(format_size(&directory), "-");
     }
 
     #[test]

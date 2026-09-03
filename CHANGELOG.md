@@ -2,7 +2,7 @@
 
 All notable changes to FlashFind are documented in this file.
 
-## [Unreleased]
+## [0.1.1] - 2026-09-03
 
 ### Fixed
 
@@ -10,6 +10,9 @@ All notable changes to FlashFind are documented in this file.
 - Added root entry counts to `flashfind roots` and post-index output, making incomplete root registration visible.
 - Made `flashfind index` default to the current user's home directory and allowed a running daemon to discover/watch roots added after startup.
 - Kept new clients compatible with the pre-pagination daemon response until that daemon is restarted.
+- Changed matching from whole-path matching to entry-name matching, so a matching directory no longer causes unrelated descendants to appear.
+- Added responsive TUI result columns for `D/F`, full path, human-readable size, and local modification time.
+- Migrated FTS to a name-only schema and repaired a transitional FTS schema that could make `*` return too few results.
 
 ## [0.1.0] - 2026-09-03
 
