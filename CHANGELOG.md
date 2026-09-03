@@ -2,6 +2,15 @@
 
 All notable changes to FlashFind are documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- Removed the service-side 200-result ceiling: CLI queries are paginated up to 10,000 entries and TUI results load additional 200-entry pages on demand.
+- Added root entry counts to `flashfind roots` and post-index output, making incomplete root registration visible.
+- Made `flashfind index` default to the current user's home directory and allowed a running daemon to discover/watch roots added after startup.
+- Kept new clients compatible with the pre-pagination daemon response until that daemon is restarted.
+
 ## [0.1.0] - 2026-09-03
 
 ### Added

@@ -69,6 +69,18 @@ pub struct IndexStats {
     pub skipped: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexedRoot {
+    pub path: PathBuf,
+    pub entries: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchPage {
+    pub results: Vec<SearchResult>,
+    pub has_more: bool,
+}
+
 pub struct Index {
     connection: Connection,
 }
@@ -226,9 +238,10 @@ impl Index {
         if query.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
-        // Do not multiply the requested limit again here. The previous design
-        // turned a 200-row TUI query into up to 25,600 SQLite candidates.
-        let candidate_limit = limit.saturating_mul(6).clamp(200, 1_200) as i64;
+        // The requested page size drives candidate collection. This keeps the
+        // 200-row TUI first page cheap while allowing a CLI/user to page much
+        // further than 200 without silently losing indexed matches.
+        let candidate_limit = limit.saturating_mul(6).clamp(256, 50_000) as i64;
         let literal = longest_literal(&query);
         let mut candidates = Vec::new();
         if literal.chars().count() >= 3 {
@@ -296,13 +309,30 @@ impl Index {
     }
 
     pub fn indexed_roots(&self) -> Result<Vec<PathBuf>> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT root FROM roots ORDER BY root")?;
+        Ok(self
+            .root_summaries()?
+            .into_iter()
+            .map(|root| root.path)
+            .collect())
+    }
+
+    /// Lists every registered root, including empty roots. A zero count means
+    /// the root is registered but currently has no readable indexed entries.
+    pub fn root_summaries(&self) -> Result<Vec<IndexedRoot>> {
+        let mut statement = self.connection.prepare(
+            "SELECT r.root, COUNT(f.id)
+             FROM roots r LEFT JOIN files f ON f.root = r.root
+             GROUP BY r.root ORDER BY r.root",
+        )?;
         let roots = statement
-            .query_map([], |row| row.get::<_, String>(0))?
+            .query_map([], |row| {
+                Ok(IndexedRoot {
+                    path: PathBuf::from(row.get::<_, String>(0)?),
+                    entries: row.get::<_, i64>(1)? as u64,
+                })
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(roots.into_iter().map(PathBuf::from).collect())
+        Ok(roots)
     }
 
     /// Evaluates `&` (intersection), `|` (union), whitespace-as-AND, and
@@ -314,7 +344,7 @@ impl Index {
         }
         // Intersection quality stays high without letting a multi-term query
         // inflate each term's candidate list into tens of thousands of rows.
-        let candidate_limit = limit.saturating_mul(4).clamp(128, 800);
+        let candidate_limit = limit.saturating_mul(4).clamp(256, 40_000);
         let mut union = std::collections::BTreeMap::<PathBuf, (SearchResult, u16)>::new();
         for group in groups {
             let mut intersection: Option<std::collections::BTreeMap<PathBuf, (SearchResult, u16)>> =
@@ -362,6 +392,30 @@ impl Index {
             .take(limit)
             .map(|(result, _)| result)
             .collect())
+    }
+
+    /// Returns a stable slice of an expression result. `has_more` is exact for
+    /// the requested bounded result window and lets a TUI load subsequent pages
+    /// instead of exposing a hidden 200-result ceiling.
+    pub fn search_expression_page(
+        &self,
+        expression: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<SearchPage> {
+        if limit == 0 {
+            return Ok(SearchPage {
+                results: Vec::new(),
+                has_more: false,
+            });
+        }
+        let requested = offset.saturating_add(limit).saturating_add(1).min(10_001);
+        let mut results = self.search_expression(expression, requested)?;
+        let has_more = results.len() > offset.saturating_add(limit);
+        let start = offset.min(results.len());
+        let end = start.saturating_add(limit).min(results.len());
+        results = results.drain(start..end).collect();
+        Ok(SearchPage { results, has_more })
     }
 }
 
@@ -678,6 +732,31 @@ mod tests {
             ]
         );
         assert!(parse_expression("report | ").is_err());
+    }
+
+    #[test]
+    fn pages_results_and_reports_root_entry_count() {
+        let mut index = Index::open(":memory:").unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "flashfind-page-test-{}-{}",
+            std::process::id(),
+            unix_seconds(SystemTime::now()).unwrap_or_default()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        for number in 0..7 {
+            fs::write(dir.join(format!("page-{number}.txt")), "x").unwrap();
+        }
+        index.index_root(&dir).unwrap();
+        let first = index.search_expression_page("page", 0, 3).unwrap();
+        assert_eq!(first.results.len(), 3);
+        assert!(first.has_more);
+        let second = index.search_expression_page("page", 3, 3).unwrap();
+        assert_eq!(second.results.len(), 3);
+        assert!(second.has_more);
+        let roots = index.root_summaries().unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].entries, 8); // root directory plus seven files
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

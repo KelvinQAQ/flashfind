@@ -2,7 +2,7 @@
 
 跨平台、低权限的“Everything 风格”文件搜索器。它由**每用户后台守护进程**和**轻量终端 TUI**组成：关闭 TUI 后索引与监听仍继续运行；再次启动 TUI 时通过本机 IPC 即时查询。
 
-不会读取 NTFS MFT、安装内核驱动或请求管理员/root 权限。它仅索引当前用户可读取的目录，因此在 Windows、macOS、Linux 具有一致、可审计的权限模型。
+不会读取 NTFS MFT、安装内核驱动或请求管理员/root 权限。它仅索引当前用户可读取的**已登记根目录**，因此在 Windows、macOS、Linux 具有一致、可审计的权限模型；它不会无权限扫描整个系统盘。首次后台启动或执行不带路径的 `flashfind index` 时，默认根目录是当前用户主目录。
 
 ## 架构与资源策略
 
@@ -103,17 +103,21 @@ invoice | receipt      # OR
 # 前台运行，适合调试；首启时显式配置索引根目录
 flashfind daemon --root ~/Documents --root ~/Projects
 
-# 只建立/重建指定根目录（并将其持久化为后台根目录）
+# 不带路径：建立/重建当前用户主目录；带路径：建立/重建指定根目录。
+# 完成后显示每个 root 的实际索引条目数。
+flashfind index
 flashfind index ~/Documents ~/Projects
 
-# 非 TUI 查询
+# 非 TUI 查询：默认最多显示 1000 条；可取 1..10000 条并手动分页
 flashfind search 'report & quarterly'
+flashfind search report --limit 10000
+flashfind search report --limit 1000 --offset 1000
 
-# 查看持久化根目录
+# 查看持久化根目录及每个 root 的实际条目数
 flashfind roots
 ```
 
-TUI 和 `search` 会尝试连接服务；若不存在便在当前用户会话中后台启动 `flashfind daemon`。若希望登录时服务已就绪，可由系统登录项启动：
+TUI 和 `search` 会尝试连接服务；若不存在便在当前用户会话中后台启动 `flashfind daemon`。TUI 首屏加载 200 条以保持流畅；选择项接近列表末尾时会自动继续加载，不存在 200 条总上限。`flashfind index <新目录>` 后，已运行的 daemon 最多在约 2 秒内发现该 root、建立原生监听，无需手动重启。若希望登录时服务已就绪，可由系统登录项启动：
 
 - **Linux systemd user unit**：`ExecStart=/绝对路径/flashfind daemon`，执行 `systemctl --user enable --now flashfind`。
 - **macOS LaunchAgent**：启动命令为 `/绝对路径/flashfind daemon`。
