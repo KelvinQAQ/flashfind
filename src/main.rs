@@ -841,22 +841,32 @@ fn highlight_literals(query: &str) -> Vec<Vec<char>> {
 /// The query applies to the leaf name. Render the full path, but do not
 /// highlight an identical word in a parent directory, which would suggest a
 /// path-match that the search engine intentionally does not perform.
-fn highlighted_path_spans(path: &str, literals: &[Vec<char>]) -> Vec<Span<'static>> {
+fn highlighted_path_spans(
+    path: &str,
+    literals: &[Vec<char>],
+    selected: bool,
+) -> Vec<Span<'static>> {
     let separator = std::path::MAIN_SEPARATOR;
     match path.rfind(separator) {
         Some(offset) => {
-            let mut spans = vec![Span::raw(path[..=offset].to_owned())];
+            let path_style = if selected {
+                Style::default().fg(Color::Black)
+            } else {
+                Style::default()
+            };
+            let mut spans = vec![Span::styled(path[..=offset].to_owned(), path_style)];
             spans.extend(highlighted_spans(
                 &path[offset + separator.len_utf8()..],
                 literals,
+                selected,
             ));
             spans
         }
-        None => highlighted_spans(path, literals),
+        None => highlighted_spans(path, literals, selected),
     }
 }
 
-fn highlighted_spans(value: &str, literals: &[Vec<char>]) -> Vec<Span<'static>> {
+fn highlighted_spans(value: &str, literals: &[Vec<char>], selected: bool) -> Vec<Span<'static>> {
     let characters = value.chars().collect::<Vec<_>>();
     let mut mask = vec![false; characters.len()];
     for literal in literals {
@@ -883,12 +893,18 @@ fn highlighted_spans(value: &str, literals: &[Vec<char>]) -> Vec<Span<'static>> 
         }
         let text = characters[start..end].iter().collect::<String>();
         let span = if highlighted {
-            Span::styled(
-                text,
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            } else {
                 Style::default()
                     .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-            )
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            };
+            Span::styled(text, style)
+        } else if selected {
+            Span::styled(text, Style::default().fg(Color::Black))
         } else {
             Span::raw(text)
         };
@@ -936,28 +952,46 @@ fn result_item(
     result: &SearchResult,
     highlights: &[Vec<char>],
     columns: ResultColumns,
+    selected: bool,
 ) -> ListItem<'static> {
     let path = result.path.to_string_lossy().into_owned();
     let path = middle_ellipsis(&path, columns.name_width);
+    let kind_style = if selected {
+        Style::default()
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Cyan)
+    };
+    let text_style = if selected {
+        Style::default().fg(Color::Black)
+    } else {
+        Style::default()
+    };
+    let metadata_style = if selected {
+        Style::default().fg(Color::Black)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
     let mut spans = vec![Span::styled(
         format!("{}  ", kind_code(&result.kind)),
-        Style::default().fg(Color::Cyan),
+        kind_style,
     )];
-    spans.extend(highlighted_path_spans(&path, highlights));
+    spans.extend(highlighted_path_spans(&path, highlights, selected));
     let padding = columns
         .name_width
         .saturating_sub(UnicodeWidthStr::width(path.as_str()));
-    spans.push(Span::raw(" ".repeat(padding)));
+    spans.push(Span::styled(" ".repeat(padding), text_style));
     if columns.show_size {
         spans.push(Span::styled(
             format!("  {:>8}", format_size(result)),
-            Style::default().fg(Color::DarkGray),
+            metadata_style,
         ));
     }
     if columns.show_modified {
         spans.push(Span::styled(
             format!("  {}", format_modified(result.modified)),
-            Style::default().fg(Color::DarkGray),
+            metadata_style,
         ));
     }
     ListItem::new(Line::from(spans))
@@ -1081,7 +1115,8 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
     let items = app
         .results
         .iter()
-        .map(|result| result_item(result, &highlights, columns))
+        .enumerate()
+        .map(|(index, result)| result_item(result, &highlights, columns, index == app.selected))
         .collect::<Vec<_>>();
     let visible_rows = chunks[1].height.saturating_sub(2).max(1) as usize;
     let offset = centered_list_offset(app.selected, app.results.len(), visible_rows);
@@ -1092,11 +1127,7 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
     frame.render_stateful_widget(
         List::new(items)
             .block(Block::default().borders(Borders::ALL))
-            .highlight_style(
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            .highlight_style(Style::default().bg(Color::Cyan).fg(Color::Black)),
         chunks[1],
         &mut state,
     );
