@@ -1,0 +1,18 @@
+# Rust build output
+/target/
+
+# IDEs and editors
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Local FlashFind data when a custom data directory points into this repository
+index.sqlite3
+index.sqlite3-shm
+index.sqlite3-wal
+ipc.token
