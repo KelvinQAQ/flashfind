@@ -32,7 +32,9 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 const ADDRESS: &str = "127.0.0.1:35185";
-const SEARCH_LIMIT: usize = 200;
+const TUI_PAGE_SIZE: usize = 200;
+const CLI_DEFAULT_LIMIT: usize = 1_000;
+const MAX_SEARCH_LIMIT: usize = 10_000;
 
 #[derive(Parser)]
 #[command(
@@ -55,13 +57,17 @@ enum Command {
         #[arg(long = "root")]
         roots: Vec<PathBuf>,
     },
-    /// Build or rebuild an index root without starting the service.
+    /// Build or rebuild index roots; without paths, indexes the current user's home directory.
     Index { roots: Vec<PathBuf> },
     /// Query the service without opening the TUI.
     Search {
         query: String,
-        #[arg(short, long, default_value_t = 30)]
+        /// Maximum number of matches to print (1..=10000).
+        #[arg(short, long, default_value_t = CLI_DEFAULT_LIMIT)]
         limit: usize,
+        /// Skip this many matches before printing, for manual pagination.
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
     },
     /// Show roots registered for background indexing.
     Roots,
@@ -76,16 +82,48 @@ struct WireRequest {
 #[derive(Serialize, Deserialize)]
 enum Request {
     Ping,
-    Search { query: String, limit: usize },
-    Delete { path: String },
-    Rename { from: String, to: String },
-    Open { path: String },
+    Search {
+        query: String,
+        offset: usize,
+        limit: usize,
+    },
+    Delete {
+        path: String,
+    },
+    Rename {
+        from: String,
+        to: String,
+    },
+    Open {
+        path: String,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum SearchReply {
+    Page(flashfind::SearchPage),
+    // A freshly upgraded TUI/CLI can still query an old daemon until that
+    // daemon is restarted; older daemons returned Results(Vec<SearchResult>).
+    Legacy(Vec<SearchResult>),
+}
+
+impl SearchReply {
+    fn into_page(self) -> flashfind::SearchPage {
+        match self {
+            Self::Page(page) => page,
+            Self::Legacy(results) => flashfind::SearchPage {
+                results,
+                has_more: false,
+            },
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
 enum Response {
     Pong,
-    Results(Vec<SearchResult>),
+    Results(SearchReply),
     Ok(String),
     Error(String),
 }
@@ -95,6 +133,11 @@ fn main() -> Result<()> {
         Command::Tui => run_tui(),
         Command::Daemon { roots } => run_daemon(roots),
         Command::Index { roots } => {
+            let roots = if roots.is_empty() {
+                default_roots()?
+            } else {
+                roots
+            };
             let mut index = Index::open_default()?;
             for root in roots {
                 let stats = index.index_root(&root)?;
@@ -105,14 +148,36 @@ fn main() -> Result<()> {
                     stats.skipped
                 );
             }
+            println!("\nRegistered roots:");
+            for root in index.root_summaries()? {
+                println!("{:>10}  {}", root.entries, root.path.display());
+            }
             Ok(())
         }
-        Command::Search { query, limit } => {
+        Command::Search {
+            query,
+            limit,
+            offset,
+        } => {
+            if !(1..=MAX_SEARCH_LIMIT).contains(&limit) {
+                bail!("--limit must be between 1 and {MAX_SEARCH_LIMIT}");
+            }
             ensure_daemon()?;
-            match send_request(Request::Search { query, limit })? {
-                Response::Results(results) => {
-                    for result in results {
+            match send_request(Request::Search {
+                query,
+                offset,
+                limit,
+            })? {
+                Response::Results(page) => {
+                    let page = page.into_page();
+                    for result in page.results {
                         println!("{:<9} {}", kind_label(&result.kind), result.path.display());
+                    }
+                    if page.has_more {
+                        eprintln!(
+                            "more results available; continue with --offset {}",
+                            offset.saturating_add(limit)
+                        );
                     }
                     Ok(())
                 }
@@ -122,8 +187,8 @@ fn main() -> Result<()> {
         }
         Command::Roots => {
             let index = Index::open_default()?;
-            for root in index.indexed_roots()? {
-                println!("{}", root.display());
+            for root in index.root_summaries()? {
+                println!("{:>10}  {}", root.entries, root.path.display());
             }
             Ok(())
         }
@@ -196,9 +261,10 @@ fn run_daemon(extra_roots: Vec<PathBuf>) -> Result<()> {
     }
 }
 
-fn index_writer(roots: Vec<PathBuf>) -> Result<()> {
+fn index_writer(mut roots: Vec<PathBuf>) -> Result<()> {
     let (sender, receiver) = mpsc::channel();
     let mut watcher = RecommendedWatcher::new(sender, Config::default())?;
+    let mut index = Index::open_default()?;
     for root in &roots {
         if !root.is_dir() {
             eprintln!("skip unavailable root: {}", root.display());
@@ -206,7 +272,6 @@ fn index_writer(roots: Vec<PathBuf>) -> Result<()> {
         }
         watcher.watch(root, RecursiveMode::Recursive)?;
     }
-    let mut index = Index::open_default()?;
     for root in &roots {
         if root.is_dir() {
             match index.index_root(root) {
@@ -219,7 +284,24 @@ fn index_writer(roots: Vec<PathBuf>) -> Result<()> {
         match receiver.recv_timeout(Duration::from_secs(2)) {
             Ok(Ok(event)) => apply_event(&mut index, &roots, event),
             Ok(Err(error)) => eprintln!("filesystem watch error: {error}"),
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // `flashfind index <new-root>` can run after the daemon has
+                // started. Discover it here, index it once, and attach a native
+                // watcher without requiring users to restart the service.
+                for root in index.indexed_roots()? {
+                    if roots.contains(&root) || !root.is_dir() {
+                        continue;
+                    }
+                    watcher.watch(&root, RecursiveMode::Recursive)?;
+                    match index.index_root(&root) {
+                        Ok(stats) => {
+                            eprintln!("added root {} ({} entries)", root.display(), stats.indexed)
+                        }
+                        Err(error) => eprintln!("could not add root {}: {error:#}", root.display()),
+                    }
+                    roots.push(root);
+                }
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => bail!("filesystem watcher stopped"),
         }
     }
@@ -269,12 +351,14 @@ fn handle_client(mut stream: TcpStream, index: &Index, token: &str) -> Result<()
     }
     let response = match wire.request {
         Request::Ping => Response::Pong,
-        Request::Search { query, limit } => {
-            match index.search_expression(&query, limit.min(SEARCH_LIMIT)) {
-                Ok(results) => Response::Results(results),
-                Err(error) => Response::Error(error.to_string()),
-            }
-        }
+        Request::Search {
+            query,
+            offset,
+            limit,
+        } => match index.search_expression_page(&query, offset, limit.clamp(1, MAX_SEARCH_LIMIT)) {
+            Ok(results) => Response::Results(SearchReply::Page(results)),
+            Err(error) => Response::Error(error.to_string()),
+        },
         Request::Delete { path } => match delete_path(Path::new(&path)) {
             Ok(()) => Response::Ok("deleted".into()),
             Err(error) => Response::Error(error.to_string()),
@@ -407,17 +491,21 @@ enum Mode {
 struct QueryRequest {
     generation: u64,
     query: String,
+    offset: usize,
 }
 
 struct QueryResponse {
     generation: u64,
-    result: std::result::Result<Vec<SearchResult>, String>,
+    offset: usize,
+    result: std::result::Result<flashfind::SearchPage, String>,
 }
 
 struct App {
     query: String,
     results: Vec<SearchResult>,
     selected: usize,
+    has_more: bool,
+    loading_more: bool,
     status: String,
     mode: Mode,
     rename: String,
@@ -435,6 +523,8 @@ impl App {
             query: String::new(),
             results: Vec::new(),
             selected: 0,
+            has_more: false,
+            loading_more: false,
             status: "输入关键词；空格/& 为“且”，| 为“或”，支持 * 与 ?".into(),
             mode: Mode::Search,
             rename: String::new(),
@@ -455,6 +545,20 @@ impl App {
     fn query_changed(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.changed_at = Instant::now();
+        self.has_more = false;
+        self.loading_more = false;
+    }
+
+    fn load_more(&mut self) {
+        if !self.has_more || self.loading_more || self.query.trim().is_empty() {
+            return;
+        }
+        self.loading_more = true;
+        let _ = self.query_sender.send(QueryRequest {
+            generation: self.generation,
+            query: self.query.clone(),
+            offset: self.results.len(),
+        });
     }
 
     /// Polling never waits for IPC. A slow database, a cold filesystem cache,
@@ -464,14 +568,26 @@ impl App {
             if response.generation != self.generation {
                 continue; // An input event superseded this response.
             }
+            self.loading_more = false;
             match response.result {
-                Ok(results) => {
-                    self.results = results;
+                Ok(page) => {
+                    if response.offset == 0 {
+                        self.results = page.results;
+                    } else {
+                        self.results.extend(page.results);
+                    }
+                    self.has_more = page.has_more;
                     self.selected = self.selected.min(self.results.len().saturating_sub(1));
-                    self.status = format!("{} 个结果", self.results.len());
+                    self.status = if self.has_more {
+                        format!("已加载 {} 个结果；继续向下可加载更多", self.results.len())
+                    } else {
+                        format!("{} 个结果", self.results.len())
+                    };
                 }
                 Err(error) => {
-                    self.results.clear();
+                    if response.offset == 0 {
+                        self.results.clear();
+                    }
                     self.status = error;
                 }
             }
@@ -479,6 +595,8 @@ impl App {
         if self.query.trim().is_empty() {
             self.results.clear();
             self.selected = 0;
+            self.has_more = false;
+            self.loading_more = false;
             self.submitted_query.clear();
             return;
         }
@@ -492,6 +610,7 @@ impl App {
         let _ = self.query_sender.send(QueryRequest {
             generation: self.generation,
             query: self.query.clone(),
+            offset: 0,
         });
     }
 }
@@ -508,9 +627,10 @@ fn start_query_worker() -> (mpsc::Sender<QueryRequest>, mpsc::Receiver<QueryResp
             }
             let result = match send_request(Request::Search {
                 query: request.query,
-                limit: SEARCH_LIMIT,
+                offset: request.offset,
+                limit: TUI_PAGE_SIZE,
             }) {
-                Ok(Response::Results(results)) => Ok(results),
+                Ok(Response::Results(results)) => Ok(results.into_page()),
                 Ok(Response::Error(error)) => Err(format!("查询语法错误：{error}")),
                 Ok(_) => Err("服务响应异常".into()),
                 Err(error) => Err(format!("服务不可用：{error}")),
@@ -518,6 +638,7 @@ fn start_query_worker() -> (mpsc::Sender<QueryRequest>, mpsc::Receiver<QueryResp
             if response_sender
                 .send(QueryResponse {
                     generation: request.generation,
+                    offset: request.offset,
                     result,
                 })
                 .is_err()
@@ -584,11 +705,17 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<b
             KeyCode::Esc => return Ok(true),
             KeyCode::Up => app.selected = app.selected.saturating_sub(1),
             KeyCode::Down => {
-                app.selected = (app.selected + 1).min(app.results.len().saturating_sub(1))
+                app.selected = (app.selected + 1).min(app.results.len().saturating_sub(1));
+                if app.selected.saturating_add(40) >= app.results.len() {
+                    app.load_more();
+                }
             }
             KeyCode::PageUp => app.selected = app.selected.saturating_sub(10),
             KeyCode::PageDown => {
-                app.selected = (app.selected + 10).min(app.results.len().saturating_sub(1))
+                app.selected = (app.selected + 10).min(app.results.len().saturating_sub(1));
+                if app.selected.saturating_add(40) >= app.results.len() {
+                    app.load_more();
+                }
             }
             KeyCode::Enter => operate(app, |path| Request::Open { path }),
             KeyCode::Delete => {
