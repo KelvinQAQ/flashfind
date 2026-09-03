@@ -2,6 +2,12 @@
 
 All notable changes to FlashFind are documented in this file.
 
+## [0.1.2] - 2026-09-03
+
+### Fixed
+
+- Added IPC protocol negotiation so a new client refuses to silently use an old daemon that cannot migrate the FTS index; it now gives a direct restart instruction.
+
 ## [0.1.1] - 2026-09-03
 
 ### Fixed
