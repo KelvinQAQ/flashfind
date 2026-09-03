@@ -1083,7 +1083,9 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
         .iter()
         .map(|result| result_item(result, &highlights, columns))
         .collect::<Vec<_>>();
-    let mut state = ListState::default();
+    let visible_rows = chunks[1].height.saturating_sub(2).max(1) as usize;
+    let offset = centered_list_offset(app.selected, app.results.len(), visible_rows);
+    let mut state = ListState::default().with_offset(offset);
     if !app.results.is_empty() {
         state.select(Some(app.selected));
     }
@@ -1123,6 +1125,19 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
             cursor_area.y + 1,
         ));
     }
+}
+
+/// Keeps selection in the middle of the list wherever possible. At the first
+/// and last page the offset is clamped so the viewport remains filled rather
+/// than showing blank rows below the final item.
+fn centered_list_offset(selected: usize, item_count: usize, visible_rows: usize) -> usize {
+    if item_count <= visible_rows || visible_rows == 0 {
+        return 0;
+    }
+    let middle = visible_rows / 2;
+    selected
+        .saturating_sub(middle)
+        .min(item_count.saturating_sub(visible_rows))
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -1205,6 +1220,15 @@ mod tests {
             ..file
         };
         assert_eq!(format_size(&directory), "-");
+    }
+
+    #[test]
+    fn keeps_selection_centered_except_at_list_edges() {
+        assert_eq!(centered_list_offset(0, 100, 11), 0);
+        assert_eq!(centered_list_offset(5, 100, 11), 0);
+        assert_eq!(centered_list_offset(40, 100, 11), 35);
+        assert_eq!(centered_list_offset(99, 100, 11), 89);
+        assert_eq!(centered_list_offset(3, 4, 11), 0);
     }
 
     #[test]

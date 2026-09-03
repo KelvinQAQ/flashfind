@@ -2,6 +2,12 @@
 
 All notable changes to FlashFind are documented in this file.
 
+## [0.1.3] - 2026-09-03
+
+### Fixed
+
+- Centered the TUI result viewport around the cursor while scrolling, with natural clamping at the first and last page.
+
 ## [0.1.2] - 2026-09-03
 
 ### Fixed
