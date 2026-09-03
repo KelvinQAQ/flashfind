@@ -821,6 +821,24 @@ fn highlight_literals(query: &str) -> Vec<Vec<char>> {
     literals
 }
 
+/// The query applies to the leaf name. Render the full path, but do not
+/// highlight an identical word in a parent directory, which would suggest a
+/// path-match that the search engine intentionally does not perform.
+fn highlighted_path_spans(path: &str, literals: &[Vec<char>]) -> Vec<Span<'static>> {
+    let separator = std::path::MAIN_SEPARATOR;
+    match path.rfind(separator) {
+        Some(offset) => {
+            let mut spans = vec![Span::raw(path[..=offset].to_owned())];
+            spans.extend(highlighted_spans(
+                &path[offset + separator.len_utf8()..],
+                literals,
+            ));
+            spans
+        }
+        None => highlighted_spans(path, literals),
+    }
+}
+
 fn highlighted_spans(value: &str, literals: &[Vec<char>]) -> Vec<Span<'static>> {
     let characters = value.chars().collect::<Vec<_>>();
     let mut mask = vec![false; characters.len()];
@@ -872,36 +890,27 @@ struct ResultColumns {
 
 impl ResultColumns {
     fn for_width(width: usize) -> Self {
-        // Type uses 2 cells (`d ` / `f `), size 9 (`  12.3 MiB`), and
-        // timestamp 20 (` 2026-09-03 12:34:56`). Preserve a useful filename
-        // area before showing optional metadata.
-        if width >= 58 {
+        // `D  ` consumes three cells. Optional data is separated by exactly
+        // two cells: `D  <path>  <size:>8  <timestamp:19>`.
+        // Keep at least 13 cells for the full path before showing all metadata.
+        if width >= 48 {
             Self {
-                name_width: width - 31,
+                name_width: width - 35,
                 show_size: true,
                 show_modified: true,
             }
-        } else if width >= 26 {
+        } else if width >= 24 {
             Self {
-                name_width: width - 11,
+                name_width: width - 13,
                 show_size: true,
                 show_modified: false,
             }
         } else {
             Self {
-                name_width: width.saturating_sub(2).max(1),
+                name_width: width.saturating_sub(3).max(1),
                 show_size: false,
                 show_modified: false,
             }
-        }
-    }
-
-    fn title(self) -> &'static str {
-        match (self.show_size, self.show_modified) {
-            (true, true) => " 结果  d/f  名称  大小  修改时间 ",
-            (true, false) => " 结果  d/f  名称  大小 ",
-            (false, false) => " 结果  d/f  名称 ",
-            (false, true) => unreachable!("modified time requires size column"),
         }
     }
 }
@@ -911,30 +920,26 @@ fn result_item(
     highlights: &[Vec<char>],
     columns: ResultColumns,
 ) -> ListItem<'static> {
-    let name = result
-        .path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| result.path.to_string_lossy().into_owned());
-    let name = middle_ellipsis(&name, columns.name_width);
+    let path = result.path.to_string_lossy().into_owned();
+    let path = middle_ellipsis(&path, columns.name_width);
     let mut spans = vec![Span::styled(
-        format!("{} ", kind_code(&result.kind)),
+        format!("{}  ", kind_code(&result.kind)),
         Style::default().fg(Color::Cyan),
     )];
-    spans.extend(highlighted_spans(&name, highlights));
+    spans.extend(highlighted_path_spans(&path, highlights));
     let padding = columns
         .name_width
-        .saturating_sub(UnicodeWidthStr::width(name.as_str()));
+        .saturating_sub(UnicodeWidthStr::width(path.as_str()));
     spans.push(Span::raw(" ".repeat(padding)));
     if columns.show_size {
         spans.push(Span::styled(
-            format!(" {:>8}", format_size(result)),
+            format!("  {:>8}", format_size(result)),
             Style::default().fg(Color::DarkGray),
         ));
     }
     if columns.show_modified {
         spans.push(Span::styled(
-            format!(" {}", format_modified(result.modified)),
+            format!("  {}", format_modified(result.modified)),
             Style::default().fg(Color::DarkGray),
         ));
     }
@@ -943,9 +948,9 @@ fn result_item(
 
 fn kind_code(kind: &Kind) -> char {
     if matches!(kind, Kind::Directory) {
-        'd'
+        'D'
     } else {
-        'f'
+        'F'
     }
 }
 
@@ -1067,11 +1072,7 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
     }
     frame.render_stateful_widget(
         List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(columns.title()),
-            )
+            .block(Block::default().borders(Borders::ALL))
             .highlight_style(
                 Style::default()
                     .bg(Color::DarkGray)

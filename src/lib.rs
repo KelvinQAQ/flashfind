@@ -434,19 +434,33 @@ pub fn default_roots() -> Result<Vec<PathBuf>> {
 /// name match every descendant. Rebuilding FTS from `name_grams` is fast and
 /// atomic at SQLite level; filesystem entries themselves are not re-walked.
 fn migrate_name_index(connection: &Connection) -> Result<()> {
-    let columns = connection
+    let file_columns = connection
         .prepare("PRAGMA table_info(files)")?
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    if columns.iter().any(|column| column == "name_grams") {
+    let has_name_grams = file_columns.iter().any(|column| column == "name_grams");
+    // A short-lived development layout had `files.name_grams` but retained an
+    // FTS column named `grams`. Check both schemas; checking only the table
+    // field would leave that index unusable and make broad queries look empty.
+    let fts_columns = connection
+        .prepare("PRAGMA table_info(file_grams)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let fts_is_current = fts_columns.iter().any(|column| column == "name_grams");
+    if has_name_grams && fts_is_current {
         return Ok(());
     }
     connection.execute_batch(
         "DROP TRIGGER IF EXISTS files_ai;
          DROP TRIGGER IF EXISTS files_ad;
-         DROP TRIGGER IF EXISTS files_au;
-         ALTER TABLE files ADD COLUMN name_grams TEXT NOT NULL DEFAULT '';",
+         DROP TRIGGER IF EXISTS files_au;",
     )?;
+    if !has_name_grams {
+        connection.execute(
+            "ALTER TABLE files ADD COLUMN name_grams TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
     let names = connection
         .prepare("SELECT id, name_folded FROM files")?
         .query_map([], |row| {
@@ -834,6 +848,37 @@ mod tests {
         let results = index.search("report", 10).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].path, PathBuf::from("/root/report-dir"));
+        let _ = fs::remove_file(database);
+    }
+
+    #[test]
+    fn migrates_transitional_name_column_with_old_fts_column() {
+        let database = std::env::temp_dir().join(format!(
+            "flashfind-transition-test-{}-{}.sqlite",
+            std::process::id(),
+            unix_seconds(SystemTime::now()).unwrap_or_default()
+        ));
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE files (
+                id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE, path_folded TEXT NOT NULL,
+                name TEXT NOT NULL, name_folded TEXT NOT NULL, name_grams TEXT NOT NULL,
+                kind TEXT NOT NULL, size INTEGER NOT NULL, modified INTEGER, root TEXT NOT NULL
+            );
+            CREATE VIRTUAL TABLE file_grams USING fts5(
+                grams, tokenize='unicode61', content='files', content_rowid='id'
+            );",
+            )
+            .unwrap();
+        connection.execute(
+            "INSERT INTO files(path, path_folded, name, name_folded, name_grams, kind, size, root)
+             VALUES(?1, ?2, ?3, ?4, ?5, 'file', 0, ?6)",
+            params!["/root/needle.txt", "/root/needle.txt", "needle.txt", "needle.txt", grams("needle.txt"), "/root"],
+        ).unwrap();
+        drop(connection);
+        let index = Index::open(&database).unwrap();
+        assert_eq!(index.search("needle", 10).unwrap().len(), 1);
         let _ = fs::remove_file(database);
     }
 
