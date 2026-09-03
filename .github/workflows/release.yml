@@ -1,0 +1,126 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+# The release job creates/updates the GitHub Release for the pushed tag.
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Format, test, and lint
+        run: |
+          cargo fmt -- --check
+          cargo test --locked
+          cargo clippy --all-targets --locked -- -D warnings
+
+  linux:
+    name: Linux (${{ matrix.asset_arch }})
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # musl makes the binary portable across mainstream Linux distributions.
+          - target: x86_64-unknown-linux-musl
+            asset_arch: x86_64
+          - target: aarch64-unknown-linux-musl
+            asset_arch: aarch64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - name: Cross-compile statically linked Linux binary
+        run: cross build --locked --release --target ${{ matrix.target }}
+      - name: Create archive and checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset="flashfind-${GITHUB_REF_NAME}-linux-${{ matrix.asset_arch }}"
+          mkdir -p "$asset"
+          cp "target/${{ matrix.target }}/release/flashfind" "$asset/"
+          cp README.md LICENSE "$asset/"
+          tar -czf "$asset.tar.gz" "$asset"
+          sha256sum "$asset.tar.gz" > "$asset.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.asset_arch }}
+          path: |
+            flashfind-*.tar.gz
+            flashfind-*.tar.gz.sha256
+          if-no-files-found: error
+
+  windows:
+    name: Windows (${{ matrix.asset_arch }})
+    needs: test
+    # Both are native GitHub-hosted runners: no fragile C/SQLite cross-linking.
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset_arch: x86_64
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            asset_arch: aarch64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build native Windows binary
+        shell: pwsh
+        run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Create archive and checksum
+        shell: pwsh
+        run: |
+          $asset = "flashfind-$env:GITHUB_REF_NAME-windows-${{ matrix.asset_arch }}"
+          New-Item -ItemType Directory -Force -Path $asset | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/flashfind.exe" "$asset/flashfind.exe"
+          Copy-Item README.md, LICENSE -Destination $asset
+          Compress-Archive -Path $asset -DestinationPath "$asset.zip"
+          $hash = (Get-FileHash "$asset.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $asset.zip" | Out-File -Encoding ascii "$asset.zip.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.asset_arch }}
+          path: |
+            flashfind-*.zip
+            flashfind-*.zip.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: [linux, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Verify checksums exist for every archive
+        run: |
+          set -euo pipefail
+          find release-assets -maxdepth 1 -type f -print | sort
+          test "$(find release-assets -name '*.tar.gz' -o -name '*.zip' | wc -l)" -eq 4
+          test "$(find release-assets -name '*.sha256' | wc -l)" -eq 4
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: FlashFind ${{ github.ref_name }}
+          body_path: .github/release-notes.md
+          files: release-assets/*
+          fail_on_unmatched_files: true
