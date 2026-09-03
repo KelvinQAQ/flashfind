@@ -44,6 +44,25 @@ cargo build --release
 
 解压后直接运行 `flashfind`（Windows 为 `flashfind.exe`）。Linux 可使用 `sha256sum -c <归档>.sha256` 校验；PowerShell 可使用 `Get-FileHash <归档> -Algorithm SHA256`。发布者执行 `git push origin main --follow-tags` 后，tag 会自动创建 GitHub Release。
 
+### 本地交叉构建（中国网络优化）
+
+仓库提供不需要 `sudo` 或 Docker 的本地交叉构建脚本。Cargo crates 默认沿用已配置的 rsproxy；脚本将 Rustup 配置为 rsproxy，并从 `ziglang.com.cn` 下载 Zig。工具和发行产物均放在项目内的忽略目录，不污染系统环境：
+
+```bash
+# 可断点续传地下载 Zig，并安装四个 Rust target / cargo-zigbuild
+scripts/bootstrap-cross.sh
+
+# 生成 Linux x86_64/aarch64、Windows x86_64/aarch64 的归档和 SHA-256
+scripts/build-release-local.sh
+```
+
+默认产物位置为 `dist/v<版本>/`。可按需替换镜像或工具目录：
+
+```bash
+ZIG_MIRROR=https://<你的内网或国内镜像>/download scripts/bootstrap-cross.sh
+FLASHFIND_TOOLS_DIR=$HOME/.cache/flashfind-tools scripts/build-release-local.sh
+```
+
 ## TUI 使用
 
 ```bash

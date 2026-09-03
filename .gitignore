@@ -1,5 +1,7 @@
-# Rust build output
+# Rust build output and user-local cross-compilation toolchain/release output
 /target/
+/.tools/
+/dist/
 
 # IDEs and editors
 .idea/
