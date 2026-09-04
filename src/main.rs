@@ -37,6 +37,7 @@ const IPC_PROTOCOL_VERSION: u16 = 3;
 const TUI_PAGE_SIZE: usize = 200;
 const CLI_DEFAULT_LIMIT: usize = 1_000;
 const MAX_SEARCH_LIMIT: usize = 10_000;
+const EVENT_BATCH_WINDOW: Duration = Duration::from_millis(2);
 
 #[derive(Parser)]
 #[command(
@@ -331,7 +332,29 @@ fn index_writer(mut roots: Vec<PathBuf>) -> Result<()> {
     }
     loop {
         match receiver.recv_timeout(Duration::from_secs(2)) {
-            Ok(Ok(event)) => apply_event(&mut index, &roots, event),
+            Ok(Ok(event)) => {
+                // Coalesce a short burst. Recursive operations emit one event
+                // per child on inotify; handling each in its own SQLite
+                // transaction creates avoidable queueing behind the parent
+                // directory event.
+                let deadline = Instant::now() + EVENT_BATCH_WINDOW;
+                let mut events = vec![event];
+                loop {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    match receiver.recv_timeout(remaining) {
+                        Ok(Ok(event)) => events.push(event),
+                        Ok(Err(error)) => eprintln!("filesystem watch error: {error}"),
+                        Err(mpsc::RecvTimeoutError::Timeout) => break,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            bail!("filesystem watcher stopped")
+                        }
+                    }
+                }
+                apply_events(&mut index, &roots, events);
+            }
             Ok(Err(error)) => eprintln!("filesystem watch error: {error}"),
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // `flashfind index <new-root>` can run after the daemon has
@@ -357,32 +380,80 @@ fn index_writer(mut roots: Vec<PathBuf>) -> Result<()> {
     }
 }
 
-fn apply_event(index: &mut Index, roots: &[PathBuf], event: Event) {
-    if matches!(event.kind, EventKind::Access(_)) {
-        return;
-    }
-    let may_change_tree = matches!(
-        event.kind,
-        EventKind::Create(_)
-            | EventKind::Remove(_)
-            | EventKind::Modify(notify::event::ModifyKind::Name(_))
-    );
-    for path in event.paths {
-        if let Some(root) = roots.iter().find(|root| path.starts_with(root)) {
-            // A directory event can represent an entire subtree on some native
-            // watcher backends. `is_indexed_directory` covers a removed or
-            // renamed directory, which no longer answers true to `is_dir()`.
-            if may_change_tree
-                && (path.is_dir() || index.is_indexed_directory(&path).unwrap_or(false))
-            {
+fn apply_events(index: &mut Index, roots: &[PathBuf], events: impl IntoIterator<Item = Event>) {
+    let data_dir = index.database_path().parent().map(Path::to_path_buf);
+    // (path, root, refreshes an entire directory subtree)
+    let mut updates: Vec<(PathBuf, PathBuf, bool)> = Vec::new();
+    for event in events {
+        // inotify reports `IN_Q_OVERFLOW` as a rescan flag: events were
+        // dropped, so a full rebuild of every root is the only way to recover
+        // without losing changes indefinitely.
+        if event.need_rescan() {
+            eprintln!("filesystem events may have been dropped; rebuilding indexed roots");
+            for root in roots {
                 if let Err(error) = index.index_root(root) {
                     eprintln!("rescan failed for {}: {error:#}", root.display());
                 }
-                return;
             }
-            if let Err(error) = index.refresh_path(&path, root) {
-                eprintln!("refresh failed for {}: {error:#}", path.display());
+            return;
+        }
+        if matches!(event.kind, EventKind::Access(_)) {
+            continue;
+        }
+        let may_change_tree = matches!(
+            event.kind,
+            EventKind::Create(_)
+                | EventKind::Remove(_)
+                | EventKind::Modify(notify::event::ModifyKind::Name(_))
+        );
+        for path in event.paths {
+            // The daemon writes its SQLite database (and WAL/SHM siblings)
+            // inside the watched root by default. Reacting to those writes
+            // would re-enter the watcher on every refresh and quickly drown
+            // out real filesystem events.
+            if data_dir.as_ref().is_some_and(|dir| path.starts_with(dir)) {
+                continue;
             }
+            let Some(root) = roots.iter().find(|root| path.starts_with(root)) else {
+                continue;
+            };
+            // A directory event can represent an entire subtree on some native
+            // watcher backends. `is_indexed_directory` covers a removed or
+            // renamed directory, which no longer answers true to `is_dir()`.
+            let subtree = may_change_tree
+                && (path.is_dir() || index.is_indexed_directory(&path).unwrap_or(false));
+            if let Some((_, _, existing_subtree)) = updates
+                .iter_mut()
+                .find(|(known_path, _, _)| known_path == &path)
+            {
+                *existing_subtree |= subtree;
+            } else {
+                updates.push((path, root.clone(), subtree));
+            }
+        }
+    }
+
+    // A parent subtree replacement also captures all child events in this
+    // burst. Dropping the descendants avoids dozens of redundant transactions
+    // for `rm -r` and directory renames while preserving final filesystem state.
+    let subtree_paths = updates
+        .iter()
+        .filter(|(_, _, subtree)| *subtree)
+        .map(|(path, _, _)| path.clone())
+        .collect::<Vec<_>>();
+    updates.retain(|(path, _, _)| {
+        !subtree_paths
+            .iter()
+            .any(|parent| parent != path && path.starts_with(parent))
+    });
+    for (path, root, subtree) in updates {
+        let result = if subtree {
+            index.refresh_subtree(&path, &root).map(|_| ())
+        } else {
+            index.refresh_path(&path, &root)
+        };
+        if let Err(error) = result {
+            eprintln!("refresh failed for {}: {error:#}", path.display());
         }
     }
 }
@@ -1360,5 +1431,74 @@ mod tests {
         assert!(literals.contains(&"报告".chars().collect()));
         assert!(literals.contains(&".pdf".chars().collect()));
         assert!(literals.contains(&"final".chars().collect()));
+    }
+
+    fn watcher_test_root(label: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("flashfind-{label}-{}-{nonce}", std::process::id()))
+    }
+
+    #[test]
+    fn watcher_ignores_events_from_its_own_data_directory() {
+        let root = watcher_test_root("self-watch-test");
+        let data_dir = root.join("data").join("flashfind");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut index = Index::open(data_dir.join("index.sqlite3")).unwrap();
+        index.index_root(&root).unwrap();
+        let roots = vec![root.clone()];
+
+        let internal = data_dir.join("self-event.txt");
+        std::fs::write(&internal, "x").unwrap();
+        apply_events(
+            &mut index,
+            &roots,
+            [Event::new(EventKind::Any).add_path(internal)],
+        );
+        assert!(index.search("self-event", 10).unwrap().is_empty());
+
+        let external = root.join("real-event.txt");
+        std::fs::write(&external, "x").unwrap();
+        apply_events(
+            &mut index,
+            &roots,
+            [Event::new(EventKind::Any).add_path(external)],
+        );
+        assert!(index
+            .search("real-event", 10)
+            .unwrap()
+            .iter()
+            .any(|result| result.path.ends_with("real-event.txt")));
+
+        drop(index);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn watcher_rescans_roots_after_notify_overflow() {
+        let root = watcher_test_root("overflow-test");
+        let data_dir = root.join("data").join("flashfind");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut index = Index::open(data_dir.join("index.sqlite3")).unwrap();
+        index.index_root(&root).unwrap();
+        let roots = vec![root.clone()];
+
+        let created_while_events_were_lost = root.join("recovered-after-overflow.txt");
+        std::fs::write(&created_while_events_were_lost, "x").unwrap();
+        apply_events(
+            &mut index,
+            &roots,
+            [Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan)],
+        );
+        assert!(index
+            .search("recovered-after-overflow", 10)
+            .unwrap()
+            .iter()
+            .any(|result| result.path.ends_with("recovered-after-overflow.txt")));
+
+        drop(index);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

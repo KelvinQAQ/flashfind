@@ -11,6 +11,13 @@ All notable changes to FlashFind are documented in this file.
 ### Fixed
 
 - Bumped the local IPC protocol after adding the containing-directory request, so clients require a daemon restart rather than sending the new action to an older service.
+- Ignored the daemon's own SQLite data directory in filesystem events, preventing WAL/SHM writes under a default home root from recursively re-triggering the watcher and silently stalling updates.
+- Rebuild only an affected directory subtree for ordinary directory create, rename, and delete events instead of rescanning the whole root; coalesce short inotify bursts to remove redundant descendant updates and tail-latency spikes.
+- Rebuild all roots when notify reports an event-overflow/rescan condition, rather than leaving a silently stale index.
+
+### Added
+
+- Added a repeatable end-to-end watcher benchmark covering file and directory subtree create, modify, rename, and delete operations at depths 1 through 6.
 
 ## [0.1.4] - 2026-09-03
 

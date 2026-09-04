@@ -197,6 +197,14 @@ impl Index {
         })
     }
 
+    /// Path of the SQLite database backing this index. For an index opened
+    /// with [`Self::open_default`], its parent is the daemon data directory;
+    /// the watcher ignores events below that directory to avoid reacting to
+    /// its own SQLite `-wal` and `-shm` writes.
+    pub fn database_path(&self) -> &Path {
+        &self.database_path
+    }
+
     fn replace_root(&mut self, root: &str, paths: Receiver<PathBuf>) -> Result<IndexStats> {
         let transaction = self.connection.transaction()?;
         remove_root(&transaction, root)?;
@@ -256,6 +264,78 @@ impl Index {
         }
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Replaces the indexed representation of one directory subtree.
+    ///
+    /// Directory create, remove, and rename notifications commonly describe a
+    /// whole subtree. Rebuilding only that subtree preserves correctness while
+    /// avoiding an expensive rebuild of an unrelated large root. A path that
+    /// no longer exists is handled as a cheap descendant delete.
+    pub fn refresh_subtree(
+        &mut self,
+        path: impl AsRef<Path>,
+        root: impl AsRef<Path>,
+    ) -> Result<IndexStats> {
+        let path = absolute_normalized(path.as_ref())?;
+        if !path.is_dir() {
+            self.refresh_path(&path, root)?;
+            return Ok(IndexStats::default());
+        }
+        let root = path_text(&absolute_normalized(root.as_ref())?);
+        let path_text = path_text(&path);
+        let (sender, receiver) = mpsc::channel();
+        let walk_root = path.clone();
+        let worker_sender = sender.clone();
+
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                WalkBuilder::new(walk_root)
+                    .hidden(false)
+                    .ignore(false)
+                    .git_ignore(false)
+                    .git_global(false)
+                    .git_exclude(false)
+                    .follow_links(false)
+                    .build_parallel()
+                    .run(|| {
+                        let sender = worker_sender.clone();
+                        Box::new(move |entry| {
+                            if let Ok(entry) = entry {
+                                let _ = sender.send(entry.into_path());
+                            }
+                            ignore::WalkState::Continue
+                        })
+                    });
+            });
+            drop(sender);
+            self.replace_subtree(&path_text, &root, receiver)
+        })
+    }
+
+    fn replace_subtree(
+        &mut self,
+        path: &str,
+        root: &str,
+        paths: Receiver<PathBuf>,
+    ) -> Result<IndexStats> {
+        let transaction = self.connection.transaction()?;
+        remove_path(&transaction, path)?;
+        let mut stats = IndexStats::default();
+        {
+            let mut insert = transaction.prepare_cached(INSERT_SQL)?;
+            for path in paths {
+                match insert_path(&mut insert, &path, root) {
+                    Ok(()) => stats.indexed += 1,
+                    Err(error) if is_skippable_filesystem_error(&error) => stats.skipped += 1,
+                    Err(error) => {
+                        return Err(error.context(format!("could not refresh {}", path.display())))
+                    }
+                }
+            }
+        }
+        transaction.commit()?;
+        Ok(stats)
     }
 
     /// Searches a case-insensitive Unicode glob term. `*` matches zero or more
@@ -1033,5 +1113,54 @@ mod tests {
         assert_eq!(directory_matches.len(), 1);
         assert!(directory_matches[0].path.ends_with("report-directory"));
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn refreshes_a_deep_directory_subtree_without_rebuilding_its_root() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "flashfind-subtree-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let parent = root.join("one/two/three/four");
+        fs::create_dir_all(&parent).unwrap();
+        fs::write(root.join("unrelated-keep.txt"), "x").unwrap();
+        let mut index = Index::open(":memory:").unwrap();
+        index.index_root(&root).unwrap();
+
+        let added = parent.join("added-tree");
+        fs::create_dir_all(added.join("nested/deeper")).unwrap();
+        fs::write(added.join("nested/deeper/needle.txt"), "x").unwrap();
+        let stats = index.refresh_subtree(&added, &root).unwrap();
+        assert_eq!(stats.indexed, 4); // directory, nested, deeper, and file
+        assert!(index
+            .search("needle", 10)
+            .unwrap()
+            .iter()
+            .any(|result| result.path.ends_with("added-tree/nested/deeper/needle.txt")));
+
+        let renamed = parent.join("renamed-tree");
+        fs::rename(&added, &renamed).unwrap();
+        // Rename notifications can arrive as independent old/new paths.
+        index.refresh_subtree(&added, &root).unwrap();
+        index.refresh_subtree(&renamed, &root).unwrap();
+        let results = index.search("needle", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0]
+            .path
+            .ends_with("renamed-tree/nested/deeper/needle.txt"));
+        assert!(index
+            .search("unrelated-keep", 10)
+            .unwrap()
+            .iter()
+            .any(|result| result.path.ends_with("unrelated-keep.txt")));
+
+        fs::remove_dir_all(&renamed).unwrap();
+        index.refresh_subtree(&renamed, &root).unwrap();
+        assert!(index.search("needle", 10).unwrap().is_empty());
+        let _ = fs::remove_dir_all(root);
     }
 }
