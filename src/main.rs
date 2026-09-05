@@ -27,7 +27,10 @@ use std::{
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
-    sync::{mpsc, Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc, Mutex,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -40,6 +43,7 @@ const TUI_PAGE_SIZE: usize = 200;
 const CLI_DEFAULT_LIMIT: usize = 1_000;
 const MAX_SEARCH_LIMIT: usize = 10_000;
 const EVENT_BATCH_WINDOW: Duration = Duration::from_millis(2);
+const EVENT_QUEUE_CAPACITY: usize = 4_096;
 
 #[derive(Parser)]
 #[command(
@@ -178,6 +182,7 @@ struct WatcherHealth {
     last_error: Option<String>,
     overflow_recoveries: u64,
     last_recovery_ms: Option<u64>,
+    queue_rescans: u64,
     initializing_root: Option<String>,
     initial_watch_ms: Option<u64>,
 }
@@ -191,6 +196,7 @@ impl Default for WatcherHealth {
             last_error: None,
             overflow_recoveries: 0,
             last_recovery_ms: None,
+            queue_rescans: 0,
             initializing_root: None,
             initial_watch_ms: None,
         }
@@ -406,8 +412,20 @@ fn index_writer(
     verbose: bool,
     health: &Arc<Mutex<WatcherHealth>>,
 ) -> Result<()> {
-    let (sender, receiver) = mpsc::channel();
-    let mut watcher = RecommendedWatcher::new(sender, Config::default())?;
+    let (sender, receiver) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
+    let queue_rescan = Arc::new(AtomicBool::new(false));
+    let callback_sender = sender.clone();
+    let callback_rescan = Arc::clone(&queue_rescan);
+    let mut watcher = RecommendedWatcher::new(
+        move |event| {
+            if callback_sender.try_send(event).is_err() {
+                // Do not block notify's native event thread. A rescan restores
+                // correctness after user-space queue pressure drops events.
+                callback_rescan.store(true, Ordering::Release);
+            }
+        },
+        Config::default(),
+    )?;
     let mut index = Index::open_default()?;
     let watch_started = Instant::now();
     let mut watched_roots = 0;
@@ -475,6 +493,13 @@ fn index_writer(
                             bail!("filesystem watcher stopped")
                         }
                     }
+                }
+                if queue_rescan.swap(false, Ordering::AcqRel) {
+                    events.push(Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan));
+                    health
+                        .lock()
+                        .expect("watcher health lock poisoned")
+                        .queue_rescans += 1;
                 }
                 if verbose {
                     for event in &events {
@@ -848,8 +873,11 @@ fn daemon_status() -> Result<()> {
             );
             println!("compatible: {}", if compatible { "yes" } else { "no" });
             println!(
-                "watcher: {} (roots {}, overflows {})",
-                watcher.state, watcher.watched_roots, watcher.overflow_recoveries
+                "watcher: {} (roots {}, overflows {}, queue rescans {})",
+                watcher.state,
+                watcher.watched_roots,
+                watcher.overflow_recoveries,
+                watcher.queue_rescans
             );
             if let Some(root) = watcher.initializing_root {
                 println!("initializing root: {root}");
