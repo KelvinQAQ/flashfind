@@ -13,6 +13,7 @@ All notable changes to FlashFind are documented in this file.
 - Retry concurrent SQLite WAL initialization instead of failing CLI clients with a transient `database is locked` error.
 - Delete directory subtrees with an index-friendly path range rather than a `substr()` predicate, while preserving sibling-prefix boundaries.
 - Report failed filesystem-overflow recovery as `watcher: failed` instead of incorrectly returning watcher status to healthy.
+- Make `daemon start` wait for native recursive watcher initialization, and expose initialization root plus elapsed watch setup time in `daemon status`.
 
 ### Added
 

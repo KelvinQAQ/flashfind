@@ -178,6 +178,8 @@ struct WatcherHealth {
     last_error: Option<String>,
     overflow_recoveries: u64,
     last_recovery_ms: Option<u64>,
+    initializing_root: Option<String>,
+    initial_watch_ms: Option<u64>,
 }
 
 impl Default for WatcherHealth {
@@ -189,6 +191,8 @@ impl Default for WatcherHealth {
             last_error: None,
             overflow_recoveries: 0,
             last_recovery_ms: None,
+            initializing_root: None,
+            initial_watch_ms: None,
         }
     }
 }
@@ -405,11 +409,18 @@ fn index_writer(
     let (sender, receiver) = mpsc::channel();
     let mut watcher = RecommendedWatcher::new(sender, Config::default())?;
     let mut index = Index::open_default()?;
+    let watch_started = Instant::now();
     let mut watched_roots = 0;
     for root in &roots {
         if !root.is_dir() {
             eprintln!("skip unavailable root: {}", root.display());
             continue;
+        }
+        {
+            let mut state = health.lock().expect("watcher health lock poisoned");
+            state.state = "initializing".into();
+            state.initializing_root = Some(root.display().to_string());
+            state.watched_roots = watched_roots;
         }
         watcher.watch(root, RecursiveMode::Recursive)?;
         watched_roots += 1;
@@ -418,6 +429,8 @@ fn index_writer(
         let mut state = health.lock().expect("watcher health lock poisoned");
         state.state = "healthy".into();
         state.watched_roots = watched_roots;
+        state.initializing_root = None;
+        state.initial_watch_ms = Some(watch_started.elapsed().as_millis() as u64);
     }
     let empty_roots = index
         .root_summaries()?
@@ -838,6 +851,12 @@ fn daemon_status() -> Result<()> {
                 "watcher: {} (roots {}, overflows {})",
                 watcher.state, watcher.watched_roots, watcher.overflow_recoveries
             );
+            if let Some(root) = watcher.initializing_root {
+                println!("initializing root: {root}");
+            }
+            if let Some(watch_ms) = watcher.initial_watch_ms {
+                println!("initial watch setup: {watch_ms} ms");
+            }
             if let Some(recovery_ms) = watcher.last_recovery_ms {
                 println!("last overflow recovery: {recovery_ms} ms");
             }
@@ -901,18 +920,28 @@ fn start_daemon(roots: &[PathBuf]) -> Result<()> {
         .stderr(Stdio::from(log))
         .spawn()
         .context("could not start background daemon")?;
-    let deadline = Instant::now() + Duration::from_secs(6);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         thread::sleep(Duration::from_millis(80));
-        if let Ok((protocol, version, _)) = daemon_status_response() {
+        if let Ok((protocol, version, watcher)) = daemon_status_response() {
             if protocol == IPC_PROTOCOL_VERSION && version == env!("CARGO_PKG_VERSION") {
-                println!("FlashFind daemon started (log: {})", log_path.display());
-                return Ok(());
+                match watcher.state.as_str() {
+                    "healthy" => {
+                        println!("FlashFind daemon started (log: {})", log_path.display());
+                        return Ok(());
+                    }
+                    "failed" => bail!(
+                        "FlashFind daemon watcher failed during startup: {}; inspect {}",
+                        watcher.last_error.unwrap_or_else(|| "unknown error".into()),
+                        log_path.display()
+                    ),
+                    _ => {}
+                }
             }
         }
     }
     bail!(
-        "FlashFind daemon did not start; inspect {}",
+        "FlashFind daemon watcher did not become ready within 30 seconds; inspect {}",
         log_path.display()
     )
 }
