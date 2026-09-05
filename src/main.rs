@@ -34,7 +34,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 const ADDRESS: &str = "127.0.0.1:35185";
-const IPC_PROTOCOL_VERSION: u16 = 4;
+const IPC_PROTOCOL_VERSION: u16 = 5;
 const TUI_PAGE_SIZE: usize = 200;
 const CLI_DEFAULT_LIMIT: usize = 1_000;
 const MAX_SEARCH_LIMIT: usize = 10_000;
@@ -166,10 +166,35 @@ impl SearchReply {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WatcherHealth {
+    state: String,
+    watched_roots: usize,
+    last_event_unix_ms: Option<i64>,
+    last_error: Option<String>,
+    overflow_recoveries: u64,
+}
+
+impl Default for WatcherHealth {
+    fn default() -> Self {
+        Self {
+            state: "starting".into(),
+            watched_roots: 0,
+            last_event_unix_ms: None,
+            last_error: None,
+            overflow_recoveries: 0,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 enum Response {
     Pong,
-    Status { protocol: u16, version: String },
+    Status {
+        protocol: u16,
+        version: String,
+        watcher: WatcherHealth,
+    },
     Results(SearchReply),
     Ok(String),
     Error(String),
@@ -299,9 +324,14 @@ fn run_daemon(extra_roots: Vec<PathBuf>, verbose: bool) -> Result<()> {
     }
     let writer_roots = roots.clone();
     let server_token = token.clone();
+    let watcher_health = Arc::new(Mutex::new(WatcherHealth::default()));
+    let writer_health = Arc::clone(&watcher_health);
     thread::spawn(move || {
-        if let Err(error) = index_writer(writer_roots, verbose) {
+        if let Err(error) = index_writer(writer_roots, verbose, &writer_health) {
             eprintln!("FlashFind index writer stopped: {error:#}");
+            let mut health = writer_health.lock().expect("watcher health lock poisoned");
+            health.state = "failed".into();
+            health.last_error = Some(format!("{error:#}"));
         }
     });
 
@@ -314,6 +344,7 @@ fn run_daemon(extra_roots: Vec<PathBuf>, verbose: bool) -> Result<()> {
     for _ in 0..2 {
         let receiver = Arc::clone(&client_receiver);
         let token = server_token.clone();
+        let health = Arc::clone(&watcher_health);
         let shutdown_sender = shutdown_sender.clone();
         thread::spawn(move || {
             let index = match Index::open_default() {
@@ -328,7 +359,7 @@ fn run_daemon(extra_roots: Vec<PathBuf>, verbose: bool) -> Result<()> {
                     Ok(stream) => stream,
                     Err(_) => return,
                 };
-                match handle_client(stream, &index, &token) {
+                match handle_client(stream, &index, &token, &health) {
                     Ok(true) => {
                         let _ = shutdown_sender.send(());
                         return;
@@ -362,16 +393,27 @@ fn run_daemon(extra_roots: Vec<PathBuf>, verbose: bool) -> Result<()> {
     }
 }
 
-fn index_writer(mut roots: Vec<PathBuf>, verbose: bool) -> Result<()> {
+fn index_writer(
+    mut roots: Vec<PathBuf>,
+    verbose: bool,
+    health: &Arc<Mutex<WatcherHealth>>,
+) -> Result<()> {
     let (sender, receiver) = mpsc::channel();
     let mut watcher = RecommendedWatcher::new(sender, Config::default())?;
     let mut index = Index::open_default()?;
+    let mut watched_roots = 0;
     for root in &roots {
         if !root.is_dir() {
             eprintln!("skip unavailable root: {}", root.display());
             continue;
         }
         watcher.watch(root, RecursiveMode::Recursive)?;
+        watched_roots += 1;
+    }
+    {
+        let mut state = health.lock().expect("watcher health lock poisoned");
+        state.state = "healthy".into();
+        state.watched_roots = watched_roots;
     }
     let empty_roots = index
         .root_summaries()?
@@ -421,6 +463,15 @@ fn index_writer(mut roots: Vec<PathBuf>, verbose: bool) -> Result<()> {
                     for event in &events {
                         eprintln!("watch {:?}: {:?}", event.kind, event.paths);
                     }
+                }
+                {
+                    let mut state = health.lock().expect("watcher health lock poisoned");
+                    state.last_event_unix_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .map(|duration| duration.as_millis() as i64);
+                    state.overflow_recoveries +=
+                        events.iter().filter(|event| event.need_rescan()).count() as u64;
                 }
                 apply_events(&mut index, &roots, events);
             }
@@ -528,7 +579,12 @@ fn apply_events(index: &mut Index, roots: &[PathBuf], events: impl IntoIterator<
 }
 
 /// Returns true only for an authenticated shutdown request.
-fn handle_client(mut stream: TcpStream, index: &Index, token: &str) -> Result<bool> {
+fn handle_client(
+    mut stream: TcpStream,
+    index: &Index,
+    token: &str,
+    health: &Arc<Mutex<WatcherHealth>>,
+) -> Result<bool> {
     stream.set_read_timeout(Some(Duration::from_secs(3)))?;
     let mut line = String::new();
     BufReader::new(stream.try_clone()?).read_line(&mut line)?;
@@ -549,6 +605,7 @@ fn handle_client(mut stream: TcpStream, index: &Index, token: &str) -> Result<bo
         Request::Status => Response::Status {
             protocol: IPC_PROTOCOL_VERSION,
             version: env!("CARGO_PKG_VERSION").to_owned(),
+            watcher: health.lock().expect("watcher health lock poisoned").clone(),
         },
         Request::Search {
             query,
@@ -672,9 +729,13 @@ fn daemon_is_listening() -> bool {
     .is_ok()
 }
 
-fn daemon_status_response() -> Result<(u16, String)> {
+fn daemon_status_response() -> Result<(u16, String, WatcherHealth)> {
     match send_request(Request::Status)? {
-        Response::Status { protocol, version } => Ok((protocol, version)),
+        Response::Status {
+            protocol,
+            version,
+            watcher,
+        } => Ok((protocol, version, watcher)),
         Response::Error(error) => bail!(error),
         _ => bail!("unexpected daemon status response"),
     }
@@ -682,7 +743,7 @@ fn daemon_status_response() -> Result<(u16, String)> {
 
 fn daemon_status() -> Result<()> {
     match daemon_status_response() {
-        Ok((protocol, version)) => {
+        Ok((protocol, version, watcher)) => {
             let compatible =
                 protocol == IPC_PROTOCOL_VERSION && version == env!("CARGO_PKG_VERSION");
             println!(
@@ -692,6 +753,16 @@ fn daemon_status() -> Result<()> {
                     .unwrap_or_default()
             );
             println!("compatible: {}", if compatible { "yes" } else { "no" });
+            println!(
+                "watcher: {} (roots {}, overflows {})",
+                watcher.state, watcher.watched_roots, watcher.overflow_recoveries
+            );
+            if let Some(last_event) = watcher.last_event_unix_ms {
+                println!("last event unix ms: {last_event}");
+            }
+            if let Some(error) = watcher.last_error {
+                println!("watcher error: {error}");
+            }
             println!("log: {}", daemon_log_path()?.display());
             Ok(())
         }
@@ -712,7 +783,7 @@ fn daemon_status() -> Result<()> {
 
 fn start_daemon(roots: &[PathBuf]) -> Result<()> {
     match daemon_status_response() {
-        Ok((protocol, version)) => {
+        Ok((protocol, version, _)) => {
             if protocol == IPC_PROTOCOL_VERSION && version == env!("CARGO_PKG_VERSION") {
                 println!("FlashFind daemon is already running");
                 return Ok(());
@@ -747,7 +818,7 @@ fn start_daemon(roots: &[PathBuf]) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(6);
     while Instant::now() < deadline {
         thread::sleep(Duration::from_millis(80));
-        if let Ok((protocol, version)) = daemon_status_response() {
+        if let Ok((protocol, version, _)) = daemon_status_response() {
             if protocol == IPC_PROTOCOL_VERSION && version == env!("CARGO_PKG_VERSION") {
                 println!("FlashFind daemon started (log: {})", log_path.display());
                 return Ok(());
@@ -830,15 +901,19 @@ fn ipc_token() -> Result<String> {
 
 fn ensure_daemon() -> Result<()> {
     match send_request(Request::Status) {
-        Ok(Response::Status { protocol, version })
-            if protocol == IPC_PROTOCOL_VERSION && version == env!("CARGO_PKG_VERSION") =>
-        {
+        Ok(Response::Status {
+            protocol, version, ..
+        }) if protocol == IPC_PROTOCOL_VERSION && version == env!("CARGO_PKG_VERSION") => {
             return Ok(())
         }
-        Ok(Response::Status { protocol, version }) if protocol == IPC_PROTOCOL_VERSION => {
+        Ok(Response::Status {
+            protocol, version, ..
+        }) if protocol == IPC_PROTOCOL_VERSION => {
             bail!("FlashFind daemon version {version} differs from this CLI ({}); run `flashfind daemon restart`", env!("CARGO_PKG_VERSION"))
         }
-        Ok(Response::Status { protocol, version }) => {
+        Ok(Response::Status {
+            protocol, version, ..
+        }) => {
             bail!("FlashFind daemon protocol {protocol} (version {version}) is incompatible; restart the background daemon after upgrading")
         }
         // An old daemon does not recognize Status. Confirm it answers the

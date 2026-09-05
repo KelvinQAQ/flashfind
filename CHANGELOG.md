@@ -2,6 +2,16 @@
 
 All notable changes to FlashFind are documented in this file.
 
+## [0.1.7] - 2026-09-05
+
+### Added
+
+- `flashfind daemon status` now reports watcher health, watched-root count, last event time, overflow recovery count, and writer failure details.
+
+### Fixed
+
+- A watcher writer failure is now surfaced as `watcher: failed` instead of leaving a daemon that appears healthy while serving stale results.
+
 ## [0.1.6] - 2026-09-04
 
 ### Added
