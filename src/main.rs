@@ -112,6 +112,9 @@ enum DaemonAction {
         /// Number of lines to print.
         #[arg(short, long, default_value_t = 100)]
         lines: usize,
+        /// Keep printing appended lines until interrupted.
+        #[arg(short, long)]
+        follow: bool,
     },
 }
 
@@ -217,7 +220,7 @@ fn main() -> Result<()> {
                 start_daemon(&roots)
             }
             DaemonAction::Status => daemon_status(),
-            DaemonAction::Logs { lines } => print_daemon_log(lines),
+            DaemonAction::Logs { lines, follow } => print_daemon_log(lines, follow),
         },
         Command::Index { roots } => {
             let roots = if roots.is_empty() {
@@ -720,6 +723,7 @@ fn format_bytes(bytes: u64) -> String {
 const DAEMON_LOG_NAME: &str = "daemon.log";
 const DAEMON_PID_NAME: &str = "daemon.pid";
 const DAEMON_ENDPOINT_NAME: &str = "daemon.addr";
+const DAEMON_LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
 
 struct DaemonPidFile {
     pid_path: PathBuf,
@@ -846,6 +850,7 @@ fn start_daemon(roots: &[PathBuf]) -> Result<()> {
     let directory = data_dir()?;
     fs::create_dir_all(&directory)?;
     let log_path = directory.join(DAEMON_LOG_NAME);
+    rotate_daemon_log(&log_path)?;
     let log = OpenOptions::new()
         .create(true)
         .append(true)
@@ -905,7 +910,20 @@ fn stop_daemon() -> Result<()> {
     bail!("daemon acknowledged shutdown but is still listening")
 }
 
-fn print_daemon_log(lines: usize) -> Result<()> {
+fn rotate_daemon_log(path: &Path) -> Result<()> {
+    rotate_log_if_oversized(path, DAEMON_LOG_MAX_BYTES)
+}
+
+fn rotate_log_if_oversized(path: &Path, max_bytes: u64) -> Result<()> {
+    if fs::metadata(path).is_ok_and(|metadata| metadata.len() >= max_bytes) {
+        let previous = path.with_extension("log.1");
+        let _ = fs::remove_file(&previous);
+        fs::rename(path, previous)?;
+    }
+    Ok(())
+}
+
+fn print_daemon_log(lines: usize, follow: bool) -> Result<()> {
     let path = daemon_log_path()?;
     let contents = match fs::read_to_string(&path) {
         Ok(contents) => contents,
@@ -920,7 +938,22 @@ fn print_daemon_log(lines: usize) -> Result<()> {
     for line in output.into_iter().rev() {
         println!("{line}");
     }
-    Ok(())
+    if !follow {
+        return Ok(());
+    }
+    let mut offset = contents.len();
+    loop {
+        thread::sleep(Duration::from_millis(250));
+        let updated = fs::read_to_string(&path)?;
+        if updated.len() < offset {
+            offset = 0; // daemon restarted and rotated/truncated the log
+        }
+        if let Some(appended) = updated.get(offset..) {
+            print!("{appended}");
+            io::stdout().flush()?;
+        }
+        offset = updated.len();
+    }
 }
 
 fn ipc_token() -> Result<String> {
@@ -1810,6 +1843,22 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("flashfind-{label}-{}-{nonce}", std::process::id()))
+    }
+
+    #[test]
+    fn rotates_oversized_daemon_log() {
+        let root = watcher_test_root("log-rotation-test");
+        std::fs::create_dir_all(&root).unwrap();
+        let log = root.join("daemon.log");
+        std::fs::write(&log, "old").unwrap();
+        // Keep the fixture tiny while exercising the same rotation helper.
+        rotate_log_if_oversized(&log, 1).unwrap();
+        assert!(!log.exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("daemon.log.1")).unwrap(),
+            "old"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
