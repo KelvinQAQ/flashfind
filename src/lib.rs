@@ -18,6 +18,7 @@ use std::{
 const APP_QUALIFIER: &str = "io";
 const APP_ORGANIZATION: &str = "FlashFind";
 const APP_NAME: &str = "FlashFind";
+const SCAN_CHANNEL_CAPACITY: usize = 4_096;
 const INSERT_SQL: &str = r#"
     INSERT INTO files(path, name, name_folded, kind, size, modified, root)
     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -92,6 +93,7 @@ pub struct DatabaseStats {
 pub struct Index {
     connection: Connection,
     database_path: PathBuf,
+    excluded_data_dir: Option<PathBuf>,
 }
 
 impl Index {
@@ -101,11 +103,19 @@ impl Index {
     pub fn open_default() -> Result<Self> {
         let dirs = ProjectDirs::from(APP_QUALIFIER, APP_ORGANIZATION, APP_NAME)
             .context("could not determine an application data directory")?;
-        fs::create_dir_all(dirs.data_local_dir()).context("could not create index directory")?;
-        Self::open(dirs.data_local_dir().join("index.sqlite3"))
+        let data_dir = dirs.data_local_dir().to_path_buf();
+        fs::create_dir_all(&data_dir).context("could not create index directory")?;
+        Self::open_with_excluded_data_dir(data_dir.join("index.sqlite3"), Some(data_dir))
     }
 
     pub fn open(database: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_excluded_data_dir(database, None)
+    }
+
+    fn open_with_excluded_data_dir(
+        database: impl AsRef<Path>,
+        excluded_data_dir: Option<PathBuf>,
+    ) -> Result<Self> {
         let database_path = database.as_ref().to_path_buf();
         let mut connection =
             Connection::open(&database_path).context("could not open SQLite index")?;
@@ -153,6 +163,7 @@ impl Index {
         Ok(Self {
             connection,
             database_path,
+            excluded_data_dir,
         })
     }
 
@@ -163,38 +174,60 @@ impl Index {
         if !root.is_dir() {
             bail!("index root is not a directory: {}", root.display());
         }
+        self.ensure_root_is_nonoverlapping(&root)?;
         let root_text = path_text(&root);
         self.connection.execute(
             "INSERT OR IGNORE INTO roots(root, added) VALUES (?1, ?2)",
             params![root_text, unix_seconds(SystemTime::now())],
         )?;
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(SCAN_CHANNEL_CAPACITY);
         let walk_root = root.clone();
+        let excluded_data_dir = self.excluded_data_dir.clone();
         let worker_sender = sender.clone();
 
         std::thread::scope(|scope| {
             scope.spawn(move || {
-                WalkBuilder::new(walk_root)
+                let mut builder = WalkBuilder::new(walk_root);
+                builder
                     .hidden(false)
                     .ignore(false)
                     .git_ignore(false)
                     .git_global(false)
                     .git_exclude(false)
-                    .follow_links(false)
-                    .build_parallel()
-                    .run(|| {
-                        let sender = worker_sender.clone();
-                        Box::new(move |entry| {
-                            if let Ok(entry) = entry {
-                                let _ = sender.send(entry.into_path());
-                            }
-                            ignore::WalkState::Continue
-                        })
-                    });
+                    .follow_links(false);
+                if let Some(excluded_data_dir) = excluded_data_dir {
+                    builder
+                        .filter_entry(move |entry| !entry.path().starts_with(&excluded_data_dir));
+                }
+                builder.build_parallel().run(|| {
+                    let sender = worker_sender.clone();
+                    Box::new(move |entry| {
+                        if let Ok(entry) = entry {
+                            let _ = sender.send(entry.into_path());
+                        }
+                        ignore::WalkState::Continue
+                    })
+                });
             });
             drop(sender);
             self.replace_root(&root_text, receiver)
         })
+    }
+
+    fn ensure_root_is_nonoverlapping(&self, candidate: &Path) -> Result<()> {
+        for existing in self.indexed_roots()? {
+            if existing == candidate {
+                continue;
+            }
+            if candidate.starts_with(&existing) || existing.starts_with(candidate) {
+                bail!(
+                    "index root {} overlaps existing root {}; remove one of them first",
+                    candidate.display(),
+                    existing.display()
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Path of the SQLite database backing this index. For an index opened
@@ -286,29 +319,34 @@ impl Index {
             transaction.commit()?;
             return Ok(IndexStats::default());
         }
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(SCAN_CHANNEL_CAPACITY);
         let walk_root = path.clone();
+        let excluded_data_dir = self.excluded_data_dir.clone();
         let worker_sender = sender.clone();
 
         std::thread::scope(|scope| {
             scope.spawn(move || {
-                WalkBuilder::new(walk_root)
+                let mut builder = WalkBuilder::new(walk_root);
+                builder
                     .hidden(false)
                     .ignore(false)
                     .git_ignore(false)
                     .git_global(false)
                     .git_exclude(false)
-                    .follow_links(false)
-                    .build_parallel()
-                    .run(|| {
-                        let sender = worker_sender.clone();
-                        Box::new(move |entry| {
-                            if let Ok(entry) = entry {
-                                let _ = sender.send(entry.into_path());
-                            }
-                            ignore::WalkState::Continue
-                        })
-                    });
+                    .follow_links(false);
+                if let Some(excluded_data_dir) = excluded_data_dir {
+                    builder
+                        .filter_entry(move |entry| !entry.path().starts_with(&excluded_data_dir));
+                }
+                builder.build_parallel().run(|| {
+                    let sender = worker_sender.clone();
+                    Box::new(move |entry| {
+                        if let Ok(entry) = entry {
+                            let _ = sender.send(entry.into_path());
+                        }
+                        ignore::WalkState::Continue
+                    })
+                });
             });
             drop(sender);
             self.replace_subtree(&path_text, &root, receiver)
@@ -1122,6 +1160,25 @@ mod tests {
         assert_eq!(directory_matches.len(), 1);
         assert!(directory_matches[0].path.ends_with("report-directory"));
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rejects_overlapping_index_roots() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "flashfind-overlap-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let child = root.join("child");
+        fs::create_dir_all(&child).unwrap();
+        let mut index = Index::open(":memory:").unwrap();
+        index.index_root(&root).unwrap();
+        assert!(index.index_root(&root).is_ok());
+        assert!(index.index_root(&child).is_err());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
