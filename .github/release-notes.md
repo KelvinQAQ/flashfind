@@ -1,4 +1,4 @@
-# FlashFind v0.1.8
+# FlashFind v0.1.9
 
 本次发布将 watcher、daemon 生命周期和高频文件更新路径提升为可观测、可恢复的生产级实现。
 
@@ -36,10 +36,10 @@ integration suite:           7/7 passed
 
 | 平台 | CPU 架构 | 文件 |
 |---|---|---|
-| Linux | x86_64（Intel/AMD 64-bit） | `flashfind-v0.1.8-linux-x86_64.tar.gz` |
-| Linux | aarch64（ARM64） | `flashfind-v0.1.8-linux-aarch64.tar.gz` |
-| Windows | x86_64（Intel/AMD 64-bit） | `flashfind-v0.1.8-windows-x86_64.zip` |
-| Windows | aarch64（ARM64） | `flashfind-v0.1.8-windows-aarch64.zip` |
+| Linux | x86_64（Intel/AMD 64-bit） | `flashfind-v0.1.9-linux-x86_64.tar.gz` |
+| Linux | aarch64（ARM64） | `flashfind-v0.1.9-linux-aarch64.tar.gz` |
+| Windows | x86_64（Intel/AMD 64-bit） | `flashfind-v0.1.9-windows-x86_64.zip` |
+| Windows | aarch64（ARM64） | `flashfind-v0.1.9-windows-aarch64.zip` |
 
 每个归档旁附有 `.sha256` 校验文件。升级后请执行：
 

@@ -2,6 +2,16 @@
 
 All notable changes to FlashFind are documented in this file.
 
+## [0.1.9] - 2026-09-05
+
+### Fixed
+
+- Release CI now builds the release binary before running daemon integration smoke tests, preventing a false-negative release gate.
+
+### Added
+
+- Added governance documents, issue/PR templates, CI/nightly/security workflows, benchmark baselines, SBOM/provenance release artifacts, and fixed toolchain configuration.
+
 ## [0.1.8] - 2026-09-05
 
 ### Fixed

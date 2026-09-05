@@ -4,7 +4,6 @@ on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
 
 # The release job creates/updates the GitHub Release for the pushed tag.
 permissions:
@@ -39,6 +38,7 @@ jobs:
           cargo fmt -- --check
           cargo test --locked
           cargo clippy --all-targets --locked -- -D warnings
+          cargo build --locked --release
           ./scripts/integration_test.py --quick
 
   linux:
