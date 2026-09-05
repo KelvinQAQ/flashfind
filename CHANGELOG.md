@@ -8,6 +8,7 @@ All notable changes to FlashFind are documented in this file.
 
 - Replaced the global fixed IPC port with a random loopback endpoint stored per data directory. Independent `XDG_DATA_HOME` instances can now run and stop their daemons without port conflicts.
 - Bumped the IPC protocol so clients reject daemons using the removed fixed-port transport.
+- Coalesced notify rename `From`/`To`/`Both` companion events by tracker, avoiding redundant subtree rebuilds during directory renames.
 
 ## [0.1.7] - 2026-09-05
 

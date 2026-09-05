@@ -20,6 +20,7 @@ use ratatui::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashSet,
     fs,
     fs::OpenOptions,
     io::{self, BufRead, BufReader, Write},
@@ -499,10 +500,37 @@ fn index_writer(
 }
 
 fn apply_events(index: &mut Index, roots: &[PathBuf], events: impl IntoIterator<Item = Event>) {
+    let events = events.into_iter().collect::<Vec<_>>();
+    // Linux notify emits From, To, and Both for one rename cookie. Both has
+    // both paths, so processing its companion From/To events would rebuild the
+    // destination subtree multiple times.
+    let paired_renames = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind,
+                EventKind::Modify(notify::event::ModifyKind::Name(
+                    notify::event::RenameMode::Both
+                ))
+            )
+        })
+        .filter_map(Event::tracker)
+        .collect::<HashSet<_>>();
     let data_dir = index.database_path().parent().map(Path::to_path_buf);
     // (path, root, refreshes an entire directory subtree)
     let mut updates: Vec<(PathBuf, PathBuf, bool)> = Vec::new();
     for event in events {
+        if matches!(
+            event.kind,
+            EventKind::Modify(notify::event::ModifyKind::Name(
+                notify::event::RenameMode::From | notify::event::RenameMode::To
+            ))
+        ) && event
+            .tracker()
+            .is_some_and(|tracker| paired_renames.contains(&tracker))
+        {
+            continue;
+        }
         // inotify reports `IN_Q_OVERFLOW` as a rescan flag: events were
         // dropped, so a full rebuild of every root is the only way to recover
         // without losing changes indefinitely.
@@ -1815,6 +1843,47 @@ mod tests {
             .iter()
             .any(|result| result.path.ends_with("real-event.txt")));
 
+        drop(index);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn watcher_deduplicates_paired_rename_events() {
+        let root = watcher_test_root("rename-pair-test");
+        let data_dir = root.join("data").join("flashfind");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut index = Index::open(data_dir.join("index.sqlite3")).unwrap();
+        let from = root.join("old-name.txt");
+        let to = root.join("new-name.txt");
+        std::fs::write(&from, "x").unwrap();
+        index.index_root(&root).unwrap();
+        std::fs::rename(&from, &to).unwrap();
+        let roots = vec![root.clone()];
+        let cookie = 42;
+        apply_events(
+            &mut index,
+            &roots,
+            [
+                Event::new(EventKind::Modify(notify::event::ModifyKind::Name(
+                    notify::event::RenameMode::From,
+                )))
+                .add_path(from.clone())
+                .set_tracker(cookie),
+                Event::new(EventKind::Modify(notify::event::ModifyKind::Name(
+                    notify::event::RenameMode::To,
+                )))
+                .add_path(to.clone())
+                .set_tracker(cookie),
+                Event::new(EventKind::Modify(notify::event::ModifyKind::Name(
+                    notify::event::RenameMode::Both,
+                )))
+                .add_path(from)
+                .add_path(to)
+                .set_tracker(cookie),
+            ],
+        );
+        assert!(index.search("old-name", 10).unwrap().is_empty());
+        assert_eq!(index.search("new-name", 10).unwrap().len(), 1);
         drop(index);
         let _ = std::fs::remove_dir_all(root);
     }
