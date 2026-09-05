@@ -23,7 +23,7 @@ use std::{
     collections::HashSet,
     fs,
     fs::OpenOptions,
-    io::{self, BufRead, BufReader, Write},
+    io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
@@ -1032,18 +1032,23 @@ fn print_daemon_log(lines: usize, follow: bool) -> Result<()> {
     if !follow {
         return Ok(());
     }
-    let mut offset = contents.len();
+    let mut offset = contents.len() as u64;
     loop {
         thread::sleep(Duration::from_millis(250));
-        let updated = fs::read_to_string(&path)?;
-        if updated.len() < offset {
+        let length = fs::metadata(&path)?.len();
+        if length < offset {
             offset = 0; // daemon restarted and rotated/truncated the log
         }
-        if let Some(appended) = updated.get(offset..) {
-            print!("{appended}");
-            io::stdout().flush()?;
+        if length == offset {
+            continue;
         }
-        offset = updated.len();
+        let mut file = fs::File::open(&path)?;
+        file.seek(SeekFrom::Start(offset))?;
+        let mut appended = String::new();
+        file.read_to_string(&mut appended)?;
+        print!("{appended}");
+        io::stdout().flush()?;
+        offset = length;
     }
 }
 
