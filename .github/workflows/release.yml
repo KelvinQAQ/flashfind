@@ -157,7 +157,8 @@ jobs:
       - name: Generate CycloneDX SBOM
         run: |
           cargo install cargo-cyclonedx --locked
-          cargo cyclonedx --format json --output release-assets
+          cargo cyclonedx --format json --override-filename flashfind-${GITHUB_REF_NAME}-sbom
+          mv flashfind-${GITHUB_REF_NAME}-sbom.cdx.json release-assets/
       - name: Verify checksums exist for every archive
         run: |
           set -euo pipefail

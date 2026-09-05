@@ -2,7 +2,7 @@
 
 All notable changes to FlashFind are documented in this file.
 
-## [0.1.10] - 2026-09-05
+## [0.1.11] - 2026-09-05
 
 ### Fixed
 

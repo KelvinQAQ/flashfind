@@ -1,0 +1,11 @@
+{
+  "version": "0.1.11",
+  "platform": "linux-x86_64",
+  "method": "isolated root; SQLite polling at 0.5 ms; 5 iterations per operation/depth",
+  "entries": 28419,
+  "file_update_ms": {"median": 2.56, "p95": 13.87},
+  "directory_delete_subtree_ms": {"median_range": [8.74, 8.93], "p95_range": [9.06, 9.10]},
+  "directory_rename_5000_files_ms": {"median": 151.23, "max": 154.57, "iterations": 10},
+  "file_burst_100_ms": {"median": 9.77},
+  "file_burst_1000_ms": {"median": 70.68}
+}
