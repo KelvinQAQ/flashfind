@@ -2,6 +2,12 @@
 
 All notable changes to FlashFind are documented in this file.
 
+## [0.1.10] - 2026-09-05
+
+### Fixed
+
+- Release publishing now generates SBOMs through the maintained `cargo-cyclonedx` CLI rather than a nonexistent GitHub Action.
+
 ## [0.1.9] - 2026-09-05
 
 ### Fixed

@@ -151,12 +151,13 @@ jobs:
         with:
           path: release-assets
           merge-multiple: true
-      - name: Generate CycloneDX SBOM
-        uses: CycloneDX/gh-cargo-cyclonedx@v2
+      - uses: dtolnay/rust-toolchain@master
         with:
-          path: .
-          output: release-assets
-          output-format: json
+          toolchain: 1.97.1
+      - name: Generate CycloneDX SBOM
+        run: |
+          cargo install cargo-cyclonedx --locked
+          cargo cyclonedx --format json --output release-assets
       - name: Verify checksums exist for every archive
         run: |
           set -euo pipefail
