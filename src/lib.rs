@@ -737,15 +737,23 @@ fn remove_exact_path(transaction: &Transaction<'_>, path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Deletes a directory and all descendants. Recursive watcher APIs commonly
-/// report only the top-level directory when an entire subtree is moved or
-/// deleted. `substr` avoids treating literal `%` or `_` as LIKE wildcards.
+/// Deletes a directory and all descendants through a BINARY-collated path
+/// range. Unlike `substr(path, ...)`, this lets SQLite use `path UNIQUE` while
+/// still distinguishing `/tree` from the sibling `/tree2`.
 fn remove_subtree(transaction: &Transaction<'_>, path: &str) -> Result<()> {
+    let separator = std::path::MAIN_SEPARATOR;
+    let prefix = if path.ends_with(separator) {
+        path.to_owned()
+    } else {
+        format!("{path}{separator}")
+    };
+    // Both native separators are ASCII (`/` or `\\`), so the immediately
+    // following byte forms an exclusive upper range bound for every child.
+    let next_separator = char::from(separator as u8 + 1);
+    let upper = format!("{}{}", &prefix[..prefix.len() - 1], next_separator);
     transaction.execute(
-        "DELETE FROM files WHERE path = ?1 OR (
-            substr(path, 1, length(?1)) = ?1 AND substr(path, length(?1) + 1, 1) = ?2
-        )",
-        params![path, std::path::MAIN_SEPARATOR.to_string()],
+        "DELETE FROM files WHERE path = ?1 OR (path >= ?2 AND path < ?3)",
+        params![path, prefix, upper],
     )?;
     Ok(())
 }
@@ -1197,6 +1205,29 @@ mod tests {
         assert_eq!(directory_matches.len(), 1);
         assert!(directory_matches[0].path.ends_with("report-directory"));
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn removes_only_the_requested_directory_subtree() {
+        let root =
+            std::env::temp_dir().join(format!("flashfind-subtree-range-{}", std::process::id()));
+        let target = root.join("tree");
+        let sibling = root.join("tree2");
+        fs::create_dir_all(&target).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        fs::write(target.join("literal_%_name.txt"), "x").unwrap();
+        fs::write(sibling.join("keep.txt"), "x").unwrap();
+        let mut index = Index::open(":memory:").unwrap();
+        index.index_root(&root).unwrap();
+        fs::remove_dir_all(&target).unwrap();
+        index.refresh_subtree(&target, &root).unwrap();
+        assert!(index.search("literal", 10).unwrap().is_empty());
+        assert!(index
+            .search("keep", 10)
+            .unwrap()
+            .iter()
+            .any(|result| result.path.ends_with("tree2/keep.txt")));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

@@ -11,6 +11,7 @@ All notable changes to FlashFind are documented in this file.
 - Coalesced notify rename `From`/`To`/`Both` companion events by tracker, avoiding redundant subtree rebuilds during directory renames.
 - Apply ordinary file changes from one notify micro-batch in a single SQLite transaction, reducing commit overhead during rapid file bursts.
 - Retry concurrent SQLite WAL initialization instead of failing CLI clients with a transient `database is locked` error.
+- Delete directory subtrees with an index-friendly path range rather than a `substr()` predicate, while preserving sibling-prefix boundaries.
 
 ### Added
 
