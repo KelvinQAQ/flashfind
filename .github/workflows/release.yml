@@ -158,7 +158,9 @@ jobs:
         run: |
           cargo install cargo-cyclonedx --locked
           cargo cyclonedx --format json --override-filename flashfind-${GITHUB_REF_NAME}-sbom
-          mv flashfind-${GITHUB_REF_NAME}-sbom.cdx.json release-assets/
+          bom="$(find . -path './release-assets' -prune -o -name '*.cdx.json' -print -quit)"
+          test -n "$bom"
+          cp "$bom" "release-assets/flashfind-${GITHUB_REF_NAME}-sbom.cdx.json"
       - name: Verify checksums exist for every archive
         run: |
           set -euo pipefail

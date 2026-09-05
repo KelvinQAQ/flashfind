@@ -2,6 +2,12 @@
 
 All notable changes to FlashFind are documented in this file.
 
+## [0.1.12] - 2026-09-05
+
+### Fixed
+
+- Release SBOM collection now discovers cargo-cyclonedx output instead of assuming its output directory.
+
 ## [0.1.11] - 2026-09-05
 
 ### Fixed
