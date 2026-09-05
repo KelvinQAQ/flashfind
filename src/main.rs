@@ -177,6 +177,7 @@ struct WatcherHealth {
     last_event_unix_ms: Option<i64>,
     last_error: Option<String>,
     overflow_recoveries: u64,
+    last_recovery_ms: Option<u64>,
 }
 
 impl Default for WatcherHealth {
@@ -187,6 +188,7 @@ impl Default for WatcherHealth {
             last_event_unix_ms: None,
             last_error: None,
             overflow_recoveries: 0,
+            last_recovery_ms: None,
         }
     }
 }
@@ -466,16 +468,30 @@ fn index_writer(
                         eprintln!("watch {:?}: {:?}", event.kind, event.paths);
                     }
                 }
+                let needs_recovery = events.iter().any(Event::need_rescan);
                 {
                     let mut state = health.lock().expect("watcher health lock poisoned");
                     state.last_event_unix_ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .ok()
                         .map(|duration| duration.as_millis() as i64);
-                    state.overflow_recoveries +=
-                        events.iter().filter(|event| event.need_rescan()).count() as u64;
+                    if needs_recovery {
+                        state.state = "recovering".into();
+                        state.overflow_recoveries += 1;
+                    }
                 }
-                apply_events(&mut index, &roots, events);
+                let recovery_started = Instant::now();
+                let recovery_succeeded = apply_events(&mut index, &roots, events);
+                if needs_recovery {
+                    let mut state = health.lock().expect("watcher health lock poisoned");
+                    state.last_recovery_ms = Some(recovery_started.elapsed().as_millis() as u64);
+                    if recovery_succeeded {
+                        state.state = "healthy".into();
+                    } else {
+                        state.state = "failed".into();
+                        state.last_error = Some("filesystem overflow recovery failed".into());
+                    }
+                }
             }
             Ok(Err(error)) => eprintln!("filesystem watch error: {error}"),
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -502,7 +518,11 @@ fn index_writer(
     }
 }
 
-fn apply_events(index: &mut Index, roots: &[PathBuf], events: impl IntoIterator<Item = Event>) {
+fn apply_events(
+    index: &mut Index,
+    roots: &[PathBuf],
+    events: impl IntoIterator<Item = Event>,
+) -> bool {
     let events = events.into_iter().collect::<Vec<_>>();
     // Linux notify emits From, To, and Both for one rename cookie. Both has
     // both paths, so processing its companion From/To events would rebuild the
@@ -539,12 +559,14 @@ fn apply_events(index: &mut Index, roots: &[PathBuf], events: impl IntoIterator<
         // without losing changes indefinitely.
         if event.need_rescan() {
             eprintln!("filesystem events may have been dropped; rebuilding indexed roots");
+            let mut recovered = true;
             for root in roots {
                 if let Err(error) = index.index_root(root) {
                     eprintln!("rescan failed for {}: {error:#}", root.display());
+                    recovered = false;
                 }
             }
-            return;
+            return recovered;
         }
         if matches!(event.kind, EventKind::Access(_)) {
             continue;
@@ -613,6 +635,7 @@ fn apply_events(index: &mut Index, roots: &[PathBuf], events: impl IntoIterator<
             );
         }
     }
+    true
 }
 
 /// Returns true only for an authenticated shutdown request.
@@ -815,6 +838,9 @@ fn daemon_status() -> Result<()> {
                 "watcher: {} (roots {}, overflows {})",
                 watcher.state, watcher.watched_roots, watcher.overflow_recoveries
             );
+            if let Some(recovery_ms) = watcher.last_recovery_ms {
+                println!("last overflow recovery: {recovery_ms} ms");
+            }
             println!("endpoint: {}", daemon_endpoint()?);
             if let Some(last_event) = watcher.last_event_unix_ms {
                 println!("last event unix ms: {last_event}");
@@ -1943,6 +1969,21 @@ mod tests {
         assert_eq!(index.search("new-name", 10).unwrap().len(), 1);
         drop(index);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn watcher_reports_failed_overflow_recovery() {
+        let root = watcher_test_root("overflow-failure-test");
+        std::fs::create_dir_all(&root).unwrap();
+        let data_dir = root.join("data").join("flashfind");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut index = Index::open(data_dir.join("index.sqlite3")).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!apply_events(
+            &mut index,
+            &[root],
+            [Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan)],
+        ));
     }
 
     #[test]
