@@ -417,7 +417,10 @@ fn index_writer(
     let callback_sender = sender.clone();
     let callback_rescan = Arc::clone(&queue_rescan);
     let mut watcher = RecommendedWatcher::new(
-        move |event| {
+        move |event: notify::Result<Event>| {
+            if event.as_ref().is_ok_and(is_ignored_watch_event) {
+                return;
+            }
             if callback_sender.try_send(event).is_err() {
                 // Do not block notify's native event thread. A rescan restores
                 // correctness after user-space queue pressure drops events.
@@ -556,6 +559,10 @@ fn index_writer(
     }
 }
 
+fn is_ignored_watch_event(event: &Event) -> bool {
+    matches!(event.kind, EventKind::Access(_))
+}
+
 fn apply_events(
     index: &mut Index,
     roots: &[PathBuf],
@@ -606,7 +613,7 @@ fn apply_events(
             }
             return recovered;
         }
-        if matches!(event.kind, EventKind::Access(_)) {
+        if is_ignored_watch_event(&event) {
             continue;
         }
         let may_change_tree = matches!(
@@ -1955,6 +1962,16 @@ mod tests {
             "old"
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ignores_non_mutating_watch_access_events() {
+        assert!(is_ignored_watch_event(&Event::new(EventKind::Access(
+            notify::event::AccessKind::Any,
+        ))));
+        assert!(!is_ignored_watch_event(&Event::new(EventKind::Modify(
+            notify::event::ModifyKind::Data(notify::event::DataChange::Any),
+        ))));
     }
 
     #[test]

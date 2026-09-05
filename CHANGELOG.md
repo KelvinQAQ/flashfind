@@ -16,6 +16,7 @@ All notable changes to FlashFind are documented in this file.
 - Make `daemon start` wait for native recursive watcher initialization, and expose initialization root plus elapsed watch setup time in `daemon status`.
 - Bound the notify-to-writer event queue; user-space queue pressure triggers an observable rescan instead of unbounded memory growth or silent event loss.
 - Make `daemon logs --follow` read only newly appended log bytes instead of rereading the whole log every polling interval.
+- Drop non-mutating notify access events before the writer queue, reducing queue and batching overhead during high-frequency writes.
 
 ### Added
 
