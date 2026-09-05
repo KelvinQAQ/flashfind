@@ -1,0 +1,42 @@
+name: Bug report
+description: Report a reproducible FlashFind defect
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: "Do not attach ipc.token, daemon.addr, SQLite indexes, or unredacted private paths."
+  - type: input
+    id: version
+    attributes:
+      label: FlashFind version
+      placeholder: "flashfind 0.1.8"
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options: [Linux, macOS, Windows, Other]
+    validations:
+      required: true
+  - type: textarea
+    id: status
+    attributes:
+      label: daemon status
+      description: Paste redacted output of `flashfind daemon status`.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+      placeholder: "1. ...\n2. ..."
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true

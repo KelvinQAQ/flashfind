@@ -1,0 +1,23 @@
+name: Security and dependencies
+
+on:
+  schedule:
+    - cron: "43 4 * * 1"
+  workflow_dispatch:
+  push:
+    paths: ["Cargo.lock", "Cargo.toml", "deny.toml", ".github/workflows/security.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check

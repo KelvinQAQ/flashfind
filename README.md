@@ -4,6 +4,14 @@
 
 不会读取 NTFS MFT、安装内核驱动或请求管理员/root 权限。它仅索引当前用户可读取的**已登记根目录**，因此在 Windows、macOS、Linux 具有一致、可审计的权限模型；它不会无权限扫描整个系统盘。首次后台启动或执行不带路径的 `flashfind index` 时，默认根目录是当前用户主目录。
 
+详细文档：
+
+- [架构](docs/architecture.md)
+- [daemon 管理](docs/daemon-management.md)
+- [故障排查](docs/troubleshooting.md)
+- [贡献指南](CONTRIBUTING.md)
+- [安全策略](SECURITY.md)
+
 ## 架构与资源策略
 
 ```text

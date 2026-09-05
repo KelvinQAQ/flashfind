@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+      - name: Format, unit tests, and lint
+        run: |
+          cargo fmt -- --check
+          cargo test --locked
+          cargo clippy --all-targets --locked -- -D warnings
+      - name: Quick daemon integration suite
+        run: ./scripts/integration_test.py --quick

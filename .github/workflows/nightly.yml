@@ -1,0 +1,29 @@
+name: Nightly validation
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  full-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+      - name: Full daemon integration suite
+        run: ./scripts/integration_test.py
+      - name: Event latency benchmark
+        run: ./scripts/benchmark_event_updates.py --iterations 5
+      - name: Upload benchmark report
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-benchmark-output
+          path: /tmp/flashfind-event-*/daemon.log
+          if-no-files-found: warn

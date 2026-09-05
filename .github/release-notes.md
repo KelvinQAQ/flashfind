@@ -1,45 +1,54 @@
-# FlashFind v0.1.6
+# FlashFind v0.1.8
 
-本次发布加入 daemon 生命周期管理与可观察日志，并强制新 CLI 识别旧 daemon，避免升级后静默复用不含 watcher 修复的后台服务。
+本次发布将 watcher、daemon 生命周期和高频文件更新路径提升为可观测、可恢复的生产级实现。
 
-## 新增 daemon 管理命令
+## 主要改进
 
-```bash
-flashfind daemon start
-flashfind daemon status
-flashfind daemon logs --lines 100
-flashfind daemon restart
-flashfind daemon stop
+- 每个数据目录使用独立的动态 loopback IPC endpoint；不同 `XDG_DATA_HOME` 可同时运行 daemon，不再争抢固定端口。
+- 新增 daemon 管理：
+
+  ```bash
+  flashfind daemon start [--wait]
+  flashfind daemon status
+  flashfind daemon logs --follow
+  flashfind daemon restart
+  flashfind daemon stop
+  ```
+
+- `daemon status` 报告 watcher 初始化、健康、恢复或失败状态，以及 root 数、overflow、queue rescan、初始化/恢复耗时。
+- watcher 忽略自身 SQLite 数据目录事件，使用有界 event queue；队列压力或内核 overflow 会触发可观测的一致性恢复，而非静默丢失更新。
+- 普通文件事件按微批在一个 SQLite transaction 中写入；目录子树删除使用索引友好的 path range。
+- 同一 rename tracker 的 `From`/`To`/`Both` companion events 被合并，避免重复子树重建。
+- SQLite WAL 初始化竞争现在重试，24 个并发客户端打开同一新数据库不再偶发 `database is locked`。
+
+## 验证基准
+
+在隔离环境中已验证：
+
+```text
+100-file burst median:       9.77 ms
+5,000-file rename x10 median: ~150 ms
+10,000-file burst:           10,000/10,000 entries indexed
+integration suite:           7/7 passed
 ```
-
-- `start` 在后台启动 daemon，并把 stdout/stderr 追加到应用数据目录的 `daemon.log`。
-- `stop` 通过本机认证 IPC 让受管 daemon 优雅退出。
-- `restart` 用于升级后切换到当前二进制。
-- `status` 显示 PID、协议、版本、兼容性和日志位置。
-- 前台诊断可使用 `flashfind daemon --verbose run` 查看原生文件监听事件批次。
-
-## 修复
-
-- IPC protocol 升级，新的 CLI 不会再静默连接到旧 watcher daemon。
-- 目录事件继续使用子树级增量刷新；SQLite WAL/SHM 自触发过滤和 notify overflow 兜底重扫仍然生效。
 
 ## 下载
 
-请选择与系统和 CPU 架构匹配的归档文件：
-
 | 平台 | CPU 架构 | 文件 |
 |---|---|---|
-| Linux | x86_64（Intel/AMD 64-bit） | `flashfind-v0.1.6-linux-x86_64.tar.gz` |
-| Linux | aarch64（ARM64） | `flashfind-v0.1.6-linux-aarch64.tar.gz` |
-| Windows | x86_64（Intel/AMD 64-bit） | `flashfind-v0.1.6-windows-x86_64.zip` |
-| Windows | aarch64（ARM64） | `flashfind-v0.1.6-windows-aarch64.zip` |
+| Linux | x86_64（Intel/AMD 64-bit） | `flashfind-v0.1.8-linux-x86_64.tar.gz` |
+| Linux | aarch64（ARM64） | `flashfind-v0.1.8-linux-aarch64.tar.gz` |
+| Windows | x86_64（Intel/AMD 64-bit） | `flashfind-v0.1.8-windows-x86_64.zip` |
+| Windows | aarch64（ARM64） | `flashfind-v0.1.8-windows-aarch64.zip` |
 
-每个归档旁附有 `.sha256` 校验文件。Linux 使用静态链接的 musl 二进制，可用于主流发行版。
-
-升级后执行：
+每个归档旁附有 `.sha256` 校验文件。升级后请执行：
 
 ```bash
 flashfind daemon restart
 ```
 
-若提示存在不支持受管关闭的旧 daemon，请按提示手动结束那一次旧进程；之后使用上述 daemon 子命令管理即可。
+对于大 root，`flashfind daemon start` 在 IPC 可用后即返回；如需等待 native recursive watcher 完全就绪，请使用：
+
+```bash
+flashfind daemon start --wait
+```

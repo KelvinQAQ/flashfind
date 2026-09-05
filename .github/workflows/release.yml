@@ -9,6 +9,8 @@ on:
 # The release job creates/updates the GitHub Release for the pushed tag.
 permissions:
   contents: write
+  attestations: write
+  id-token: write
 
 jobs:
   test:
@@ -16,12 +18,28 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Format, test, and lint
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+      - name: Verify release version consistency
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            cargo_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+            test "$GITHUB_REF_NAME" = "v$cargo_version"
+            test "$version" = "$cargo_version"
+            grep -q "^## \[$version\]" CHANGELOG.md
+            grep -q "^# FlashFind v$version$" .github/release-notes.md
+          fi
+      - name: Format, test, lint, and integration smoke
         run: |
           cargo fmt -- --check
           cargo test --locked
           cargo clippy --all-targets --locked -- -D warnings
+          ./scripts/integration_test.py --quick
 
   linux:
     name: Linux (${{ matrix.asset_arch }})
@@ -34,13 +52,15 @@ jobs:
           # musl makes the binary portable across mainstream Linux distributions.
           - target: x86_64-unknown-linux-musl
             asset_arch: x86_64
+            smoke: true
           - target: aarch64-unknown-linux-musl
             asset_arch: aarch64
+            smoke: false
     steps:
       - uses: actions/checkout@v4
       - uses: taiki-e/install-action@v2
         with:
-          tool: cross
+          tool: cross@0.2.5
       - name: Cross-compile statically linked Linux binary
         run: cross build --locked --release --target ${{ matrix.target }}
       - name: Create archive and checksum
@@ -53,6 +73,17 @@ jobs:
           cp README.md LICENSE "$asset/"
           tar -czf "$asset.tar.gz" "$asset"
           sha256sum "$asset.tar.gz" > "$asset.tar.gz.sha256"
+      - name: Smoke test Linux release archive
+        if: matrix.smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset="flashfind-${GITHUB_REF_NAME}-linux-${{ matrix.asset_arch }}"
+          sha256sum -c "$asset.tar.gz.sha256"
+          rm -rf smoke
+          mkdir smoke
+          tar -xzf "$asset.tar.gz" -C smoke
+          "./smoke/$asset/flashfind" --version | grep -Fx "flashfind ${GITHUB_REF_NAME#v}"
       - uses: actions/upload-artifact@v4
         with:
           name: linux-${{ matrix.asset_arch }}
@@ -78,8 +109,9 @@ jobs:
             asset_arch: aarch64
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.97.1
           targets: ${{ matrix.target }}
       - name: Build native Windows binary
         shell: pwsh
@@ -94,6 +126,13 @@ jobs:
           Compress-Archive -Path $asset -DestinationPath "$asset.zip"
           $hash = (Get-FileHash "$asset.zip" -Algorithm SHA256).Hash.ToLower()
           "$hash  $asset.zip" | Out-File -Encoding ascii "$asset.zip.sha256"
+      - name: Smoke test Windows release archive
+        shell: pwsh
+        run: |
+          $asset = "flashfind-$env:GITHUB_REF_NAME-windows-${{ matrix.asset_arch }}"
+          Expand-Archive -Path "$asset.zip" -DestinationPath smoke -Force
+          & ".\\smoke\\$asset\\flashfind.exe" --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - uses: actions/upload-artifact@v4
         with:
           name: windows-${{ matrix.asset_arch }}
@@ -112,12 +151,24 @@ jobs:
         with:
           path: release-assets
           merge-multiple: true
+      - name: Generate CycloneDX SBOM
+        uses: CycloneDX/gh-cargo-cyclonedx@v2
+        with:
+          path: .
+          output: release-assets
+          output-format: json
       - name: Verify checksums exist for every archive
         run: |
           set -euo pipefail
           find release-assets -maxdepth 1 -type f -print | sort
           test "$(find release-assets -name '*.tar.gz' -o -name '*.zip' | wc -l)" -eq 4
           test "$(find release-assets -name '*.sha256' | wc -l)" -eq 4
+          test -n "$(find release-assets -name '*bom*.json' -o -name 'bom.json')"
+          (cd release-assets && sha256sum -c ./*.sha256)
+          test "$(find release-assets -type f \( -name '*.tar.gz' -o -name '*.zip' \) -printf '%f\n' | grep -Ec "^flashfind-${GITHUB_REF_NAME}-(linux|windows)-(x86_64|aarch64)\\.(tar\\.gz|zip)$")" -eq 4
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: release-assets/*
       - uses: softprops/action-gh-release@v2
         with:
           name: FlashFind ${{ github.ref_name }}

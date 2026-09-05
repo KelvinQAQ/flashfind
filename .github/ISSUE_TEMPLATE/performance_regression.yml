@@ -1,0 +1,32 @@
+name: Performance regression
+description: Report measurable indexing or search slowdown
+title: "perf: "
+labels: [performance]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: FlashFind version
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include OS, filesystem, root entry/directory count, and whether XDG_DATA_HOME is inside the root.
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Reproduction command
+      description: Include iteration count and exact operation.
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: Measured result
+      description: Include min/median/p95/max where possible.
+    validations:
+      required: true
