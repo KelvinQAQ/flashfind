@@ -119,14 +119,25 @@ impl Index {
         let database_path = database.as_ref().to_path_buf();
         let mut connection =
             Connection::open(&database_path).context("could not open SQLite index")?;
-        connection
-            .pragma_update(None, "journal_mode", "WAL")
-            .context("could not enable SQLite WAL mode")?;
+        // Set this before any write-capable PRAGMA/schema operation. Concurrent
+        // CLI clients can all open a fresh database at once; WAL setup must wait
+        // for the first connection rather than immediately returning BUSY.
+        connection.busy_timeout(std::time::Duration::from_secs(3))?;
+        let wal_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            match connection.pragma_update(None, "journal_mode", "WAL") {
+                Ok(()) => break,
+                Err(error)
+                    if error.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy)
+                        && std::time::Instant::now() < wal_deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(error) => return Err(error).context("could not enable SQLite WAL mode"),
+            }
+        }
         connection.pragma_update(None, "synchronous", "NORMAL")?;
         connection.pragma_update(None, "temp_store", "MEMORY")?;
-        // A reader/writer hand-off around WAL checkpoints should wait briefly,
-        // not surface a transient "database is locked" error to the TUI.
-        connection.busy_timeout(std::time::Duration::from_secs(3))?;
         connection.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS files (

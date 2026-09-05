@@ -10,6 +10,11 @@ All notable changes to FlashFind are documented in this file.
 - Bumped the IPC protocol so clients reject daemons using the removed fixed-port transport.
 - Coalesced notify rename `From`/`To`/`Both` companion events by tracker, avoiding redundant subtree rebuilds during directory renames.
 - Apply ordinary file changes from one notify micro-batch in a single SQLite transaction, reducing commit overhead during rapid file bursts.
+- Retry concurrent SQLite WAL initialization instead of failing CLI clients with a transient `database is locked` error.
+
+### Added
+
+- Added a repeatable integration suite covering daemon endpoint isolation, lifecycle, stale-state recovery, burst consistency, 5,000-file renames, concurrent SQLite initialization, and SIGKILL recovery.
 
 ## [0.1.7] - 2026-09-05
 
