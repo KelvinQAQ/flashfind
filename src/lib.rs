@@ -253,7 +253,7 @@ impl Index {
         let path = absolute_normalized(path.as_ref())?;
         let root = path_text(&absolute_normalized(root.as_ref())?);
         let transaction = self.connection.transaction()?;
-        remove_path(&transaction, &path_text(&path))?;
+        remove_exact_path(&transaction, &path_text(&path))?;
         if path.exists() {
             let mut insert = transaction.prepare_cached(INSERT_SQL)?;
             if let Err(error) = insert_path(&mut insert, &path, &root) {
@@ -278,12 +278,14 @@ impl Index {
         root: impl AsRef<Path>,
     ) -> Result<IndexStats> {
         let path = absolute_normalized(path.as_ref())?;
-        if !path.is_dir() {
-            self.refresh_path(&path, root)?;
-            return Ok(IndexStats::default());
-        }
         let root = path_text(&absolute_normalized(root.as_ref())?);
         let path_text = path_text(&path);
+        if !path.is_dir() {
+            let transaction = self.connection.transaction()?;
+            remove_subtree(&transaction, &path_text)?;
+            transaction.commit()?;
+            return Ok(IndexStats::default());
+        }
         let (sender, receiver) = mpsc::channel();
         let walk_root = path.clone();
         let worker_sender = sender.clone();
@@ -320,7 +322,7 @@ impl Index {
         paths: Receiver<PathBuf>,
     ) -> Result<IndexStats> {
         let transaction = self.connection.transaction()?;
-        remove_path(&transaction, path)?;
+        remove_subtree(&transaction, path)?;
         let mut stats = IndexStats::default();
         {
             let mut insert = transaction.prepare_cached(INSERT_SQL)?;
@@ -653,10 +655,17 @@ fn remove_root(transaction: &Transaction<'_>, root: &str) -> Result<()> {
     Ok(())
 }
 
-fn remove_path(transaction: &Transaction<'_>, path: &str) -> Result<()> {
-    // Remove descendants too: recursive watcher APIs commonly report only the
-    // top-level directory when an entire subtree is moved or deleted. `substr`
-    // avoids treating literal `%` or `_` in a filename as LIKE wildcards.
+/// Deletes one file path through the `path UNIQUE` index. Ordinary file
+/// updates must not scan possible descendants in a large index.
+fn remove_exact_path(transaction: &Transaction<'_>, path: &str) -> Result<()> {
+    transaction.execute("DELETE FROM files WHERE path = ?1", [path])?;
+    Ok(())
+}
+
+/// Deletes a directory and all descendants. Recursive watcher APIs commonly
+/// report only the top-level directory when an entire subtree is moved or
+/// deleted. `substr` avoids treating literal `%` or `_` as LIKE wildcards.
+fn remove_subtree(transaction: &Transaction<'_>, path: &str) -> Result<()> {
     transaction.execute(
         "DELETE FROM files WHERE path = ?1 OR (
             substr(path, 1, length(?1)) = ?1 AND substr(path, length(?1) + 1, 1) = ?2
