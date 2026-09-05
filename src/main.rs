@@ -104,7 +104,11 @@ enum DaemonAction {
     /// Run in the foreground (also the default for `flashfind daemon`).
     Run,
     /// Start a managed background daemon and append its output to daemon.log.
-    Start,
+    Start {
+        /// Wait until native recursive filesystem watches are fully established.
+        #[arg(long)]
+        wait: bool,
+    },
     /// Ask the managed daemon to stop gracefully.
     Stop,
     /// Stop the managed daemon, then start a fresh background daemon.
@@ -225,11 +229,11 @@ fn main() -> Result<()> {
             action,
         } => match action.unwrap_or(DaemonAction::Run) {
             DaemonAction::Run => run_daemon(roots, verbose),
-            DaemonAction::Start => start_daemon(&roots),
+            DaemonAction::Start { wait } => start_daemon(&roots, wait),
             DaemonAction::Stop => stop_daemon(),
             DaemonAction::Restart => {
                 stop_daemon()?;
-                start_daemon(&roots)
+                start_daemon(&roots, true)
             }
             DaemonAction::Status => daemon_status(),
             DaemonAction::Logs { lines, follow } => print_daemon_log(lines, follow),
@@ -920,7 +924,7 @@ fn daemon_status() -> Result<()> {
     }
 }
 
-fn start_daemon(roots: &[PathBuf]) -> Result<()> {
+fn start_daemon(roots: &[PathBuf], wait_ready: bool) -> Result<()> {
     match daemon_status_response() {
         Ok((protocol, version, _)) => {
             if protocol == IPC_PROTOCOL_VERSION && version == env!("CARGO_PKG_VERSION") {
@@ -970,6 +974,13 @@ fn start_daemon(roots: &[PathBuf]) -> Result<()> {
                         watcher.last_error.unwrap_or_else(|| "unknown error".into()),
                         log_path.display()
                     ),
+                    _ if !wait_ready => {
+                        println!(
+                            "FlashFind daemon started; watcher is initializing (log: {})",
+                            log_path.display()
+                        );
+                        return Ok(());
+                    }
                     _ => {}
                 }
             }
@@ -1107,7 +1118,7 @@ fn ensure_daemon() -> Result<()> {
         }
         _ => {}
     }
-    start_daemon(&[])
+    start_daemon(&[], false)
 }
 
 fn delete_path(path: &Path) -> Result<()> {

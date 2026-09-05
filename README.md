@@ -110,7 +110,9 @@ flashfind daemon --root ~/Documents --root ~/Projects run
 flashfind daemon --verbose run
 
 # 管理后台 daemon：日志位于应用数据目录的 daemon.log
+# 默认 start 在 IPC 可用后立即返回；大 root 建 watch 时用 --wait 等待完全就绪。
 flashfind daemon start
+flashfind daemon start --wait
 flashfind daemon status
 flashfind daemon logs --lines 100
 flashfind daemon restart
