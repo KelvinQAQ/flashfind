@@ -2,6 +2,19 @@
 
 All notable changes to FlashFind are documented in this file.
 
+## [0.1.6] - 2026-09-04
+
+### Added
+
+- Added `flashfind daemon start`, `stop`, `restart`, `status`, and `logs` for managing the per-user background service without external PID or `pkill` commands.
+- Added `flashfind daemon --verbose run` to print filesystem event batches while diagnosing watcher behavior in the foreground.
+
+### Fixed
+
+- Background startup now appends daemon output to the application data directory's `daemon.log` instead of discarding it.
+- Added an authenticated IPC shutdown request and PID-file cleanup for graceful managed daemon restarts.
+- Bumped the IPC protocol so a new CLI refuses to silently reuse an older daemon that lacks watcher fixes or managed shutdown.
+
 ## [0.1.5] - 2026-09-03
 
 ### Added

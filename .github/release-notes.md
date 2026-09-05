@@ -1,15 +1,27 @@
-# FlashFind v0.1.5
+# FlashFind v0.1.6
 
-本次发布修复默认以 home 为索引 root 时的 watcher 自触发问题，并显著降低目录事件的索引更新延迟。
+本次发布加入 daemon 生命周期管理与可观察日志，并强制新 CLI 识别旧 daemon，避免升级后静默复用不含 watcher 修复的后台服务。
 
-## 修复与性能
+## 新增 daemon 管理命令
 
-- 忽略 FlashFind 自身 SQLite 数据目录的事件；`index.sqlite3-wal` / `-shm` 写入不会再触发递归刷新，从而避免索引静默停止更新。
-- notify/inotify 报告事件溢出时，daemon 会明确记录日志并完整重建已登记 root，恢复一致性。
-- 普通目录新增、删除和改名只重建受影响子树，而不再重扫整个 root。
-- inotify 事件以 2 ms 微批合并；递归删除和目录改名产生的重复子项通知会被去重。
+```bash
+flashfind daemon start
+flashfind daemon status
+flashfind daemon logs --lines 100
+flashfind daemon restart
+flashfind daemon stop
+```
 
-在包含约 28,000 条目的隔离 root 中，44 项目录子树操作的数据库提交延迟从原先全 root 重扫的约 0.8–1.0 秒降至约 12–20 ms；105 次文件/目录操作的 p95 为 17.22 ms。
+- `start` 在后台启动 daemon，并把 stdout/stderr 追加到应用数据目录的 `daemon.log`。
+- `stop` 通过本机认证 IPC 让受管 daemon 优雅退出。
+- `restart` 用于升级后切换到当前二进制。
+- `status` 显示 PID、协议、版本、兼容性和日志位置。
+- 前台诊断可使用 `flashfind daemon --verbose run` 查看原生文件监听事件批次。
+
+## 修复
+
+- IPC protocol 升级，新的 CLI 不会再静默连接到旧 watcher daemon。
+- 目录事件继续使用子树级增量刷新；SQLite WAL/SHM 自触发过滤和 notify overflow 兜底重扫仍然生效。
 
 ## 下载
 
@@ -17,25 +29,17 @@
 
 | 平台 | CPU 架构 | 文件 |
 |---|---|---|
-| Linux | x86_64（Intel/AMD 64-bit） | `flashfind-v0.1.5-linux-x86_64.tar.gz` |
-| Linux | aarch64（ARM64） | `flashfind-v0.1.5-linux-aarch64.tar.gz` |
-| Windows | x86_64（Intel/AMD 64-bit） | `flashfind-v0.1.5-windows-x86_64.zip` |
-| Windows | aarch64（ARM64） | `flashfind-v0.1.5-windows-aarch64.zip` |
+| Linux | x86_64（Intel/AMD 64-bit） | `flashfind-v0.1.6-linux-x86_64.tar.gz` |
+| Linux | aarch64（ARM64） | `flashfind-v0.1.6-linux-aarch64.tar.gz` |
+| Windows | x86_64（Intel/AMD 64-bit） | `flashfind-v0.1.6-windows-x86_64.zip` |
+| Windows | aarch64（ARM64） | `flashfind-v0.1.6-windows-aarch64.zip` |
 
 每个归档旁附有 `.sha256` 校验文件。Linux 使用静态链接的 musl 二进制，可用于主流发行版。
 
-## 校验
-
-Linux：
+升级后执行：
 
 ```bash
-sha256sum -c flashfind-v0.1.5-linux-x86_64.tar.gz.sha256
+flashfind daemon restart
 ```
 
-PowerShell：
-
-```powershell
-Get-FileHash .\flashfind-v0.1.5-windows-x86_64.zip -Algorithm SHA256
-```
-
-解压后直接运行 `flashfind`（Windows 为 `flashfind.exe`）。已有 daemon 的用户应先停止旧 daemon；新版 CLI/TUI 会在协议不匹配时提示重启。
+若提示存在不支持受管关闭的旧 daemon，请按提示手动结束那一次旧进程；之后使用上述 daemon 子命令管理即可。

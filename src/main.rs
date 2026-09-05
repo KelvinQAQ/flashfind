@@ -21,6 +21,7 @@ use ratatui::{
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
+    fs::OpenOptions,
     io::{self, BufRead, BufReader, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
@@ -33,7 +34,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 const ADDRESS: &str = "127.0.0.1:35185";
-const IPC_PROTOCOL_VERSION: u16 = 3;
+const IPC_PROTOCOL_VERSION: u16 = 4;
 const TUI_PAGE_SIZE: usize = 200;
 const CLI_DEFAULT_LIMIT: usize = 1_000;
 const MAX_SEARCH_LIMIT: usize = 10_000;
@@ -54,11 +55,16 @@ struct Cli {
 enum Command {
     /// Start the interactive search interface (the default command).
     Tui,
-    /// Run the per-user index and filesystem-monitoring service in the foreground.
+    /// Run or manage the per-user index and filesystem-monitoring service.
     Daemon {
         /// Roots to add/build before serving; defaults to the user's home directory on first run.
-        #[arg(long = "root")]
+        #[arg(long = "root", global = true)]
         roots: Vec<PathBuf>,
+        /// Print filesystem-index update activity while running in the foreground.
+        #[arg(short, long, global = true)]
+        verbose: bool,
+        #[command(subcommand)]
+        action: Option<DaemonAction>,
     },
     /// Build or rebuild index roots; without paths, indexes the current user's home directory.
     Index { roots: Vec<PathBuf> },
@@ -86,6 +92,26 @@ enum MaintenanceAction {
     Stats,
     Checkpoint,
     Compact,
+}
+
+#[derive(Subcommand)]
+enum DaemonAction {
+    /// Run in the foreground (also the default for `flashfind daemon`).
+    Run,
+    /// Start a managed background daemon and append its output to daemon.log.
+    Start,
+    /// Ask the managed daemon to stop gracefully.
+    Stop,
+    /// Stop the managed daemon, then start a fresh background daemon.
+    Restart,
+    /// Show whether a compatible daemon is listening.
+    Status,
+    /// Print the last lines from the managed background daemon log.
+    Logs {
+        /// Number of lines to print.
+        #[arg(short, long, default_value_t = 100)]
+        lines: usize,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -116,6 +142,7 @@ enum Request {
     OpenParent {
         path: String,
     },
+    Shutdown,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -151,7 +178,21 @@ enum Response {
 fn main() -> Result<()> {
     match Cli::parse().command.unwrap_or(Command::Tui) {
         Command::Tui => run_tui(),
-        Command::Daemon { roots } => run_daemon(roots),
+        Command::Daemon {
+            roots,
+            verbose,
+            action,
+        } => match action.unwrap_or(DaemonAction::Run) {
+            DaemonAction::Run => run_daemon(roots, verbose),
+            DaemonAction::Start => start_daemon(&roots),
+            DaemonAction::Stop => stop_daemon(),
+            DaemonAction::Restart => {
+                stop_daemon()?;
+                start_daemon(&roots)
+            }
+            DaemonAction::Status => daemon_status(),
+            DaemonAction::Logs { lines } => print_daemon_log(lines),
+        },
         Command::Index { roots } => {
             let roots = if roots.is_empty() {
                 default_roots()?
@@ -234,10 +275,12 @@ fn main() -> Result<()> {
 
 /// The daemon owns writes and filesystem notifications. TUI clients only read
 /// through a separate SQLite connection managed by this local IPC server.
-fn run_daemon(extra_roots: Vec<PathBuf>) -> Result<()> {
+fn run_daemon(extra_roots: Vec<PathBuf>, verbose: bool) -> Result<()> {
     let listener = TcpListener::bind(ADDRESS).with_context(|| {
         format!("could not bind {ADDRESS}; another FlashFind daemon may already be running")
     })?;
+    listener.set_nonblocking(true)?;
+    let _pid_file = DaemonPidFile::create()?;
     let token = ipc_token()?;
     let read_index = Index::open_default()?;
     let mut roots = read_index.indexed_roots()?;
@@ -257,7 +300,7 @@ fn run_daemon(extra_roots: Vec<PathBuf>) -> Result<()> {
     let writer_roots = roots.clone();
     let server_token = token.clone();
     thread::spawn(move || {
-        if let Err(error) = index_writer(writer_roots) {
+        if let Err(error) = index_writer(writer_roots, verbose) {
             eprintln!("FlashFind index writer stopped: {error:#}");
         }
     });
@@ -267,9 +310,11 @@ fn run_daemon(extra_roots: Vec<PathBuf>) -> Result<()> {
     // and WAL still permits the index writer to run concurrently.
     let (client_sender, client_receiver) = mpsc::sync_channel::<TcpStream>(32);
     let client_receiver = Arc::new(Mutex::new(client_receiver));
+    let (shutdown_sender, shutdown_receiver) = mpsc::channel::<()>();
     for _ in 0..2 {
         let receiver = Arc::clone(&client_receiver);
         let token = server_token.clone();
+        let shutdown_sender = shutdown_sender.clone();
         thread::spawn(move || {
             let index = match Index::open_default() {
                 Ok(index) => index,
@@ -283,22 +328,41 @@ fn run_daemon(extra_roots: Vec<PathBuf>) -> Result<()> {
                     Ok(stream) => stream,
                     Err(_) => return,
                 };
-                if let Err(error) = handle_client(stream, &index, &token) {
-                    eprintln!("IPC request failed: {error:#}");
+                match handle_client(stream, &index, &token) {
+                    Ok(true) => {
+                        let _ = shutdown_sender.send(());
+                        return;
+                    }
+                    Ok(false) => {}
+                    Err(error) => eprintln!("IPC request failed: {error:#}"),
                 }
             }
         });
     }
-    eprintln!("FlashFind daemon listening on {ADDRESS}");
+    eprintln!(
+        "FlashFind daemon listening on {ADDRESS} (pid {})",
+        std::process::id()
+    );
     loop {
-        let (stream, _) = listener.accept()?;
-        if client_sender.send(stream).is_err() {
-            bail!("FlashFind IPC workers stopped");
+        if shutdown_receiver.try_recv().is_ok() {
+            eprintln!("FlashFind daemon stopped");
+            return Ok(());
+        }
+        match listener.accept() {
+            Ok((stream, _)) => {
+                if client_sender.send(stream).is_err() {
+                    bail!("FlashFind IPC workers stopped");
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => return Err(error.into()),
         }
     }
 }
 
-fn index_writer(mut roots: Vec<PathBuf>) -> Result<()> {
+fn index_writer(mut roots: Vec<PathBuf>, verbose: bool) -> Result<()> {
     let (sender, receiver) = mpsc::channel();
     let mut watcher = RecommendedWatcher::new(sender, Config::default())?;
     let mut index = Index::open_default()?;
@@ -351,6 +415,11 @@ fn index_writer(mut roots: Vec<PathBuf>) -> Result<()> {
                         Err(mpsc::RecvTimeoutError::Disconnected) => {
                             bail!("filesystem watcher stopped")
                         }
+                    }
+                }
+                if verbose {
+                    for event in &events {
+                        eprintln!("watch {:?}: {:?}", event.kind, event.paths);
                     }
                 }
                 apply_events(&mut index, &roots, events);
@@ -458,7 +527,8 @@ fn apply_events(index: &mut Index, roots: &[PathBuf], events: impl IntoIterator<
     }
 }
 
-fn handle_client(mut stream: TcpStream, index: &Index, token: &str) -> Result<()> {
+/// Returns true only for an authenticated shutdown request.
+fn handle_client(mut stream: TcpStream, index: &Index, token: &str) -> Result<bool> {
     stream.set_read_timeout(Some(Duration::from_secs(3)))?;
     let mut line = String::new();
     BufReader::new(stream.try_clone()?).read_line(&mut line)?;
@@ -468,7 +538,11 @@ fn handle_client(mut stream: TcpStream, index: &Index, token: &str) -> Result<()
             &mut stream,
             &Response::Error("unauthorized local request".into()),
         )?;
-        return Ok(());
+        return Ok(false);
+    }
+    if matches!(wire.request, Request::Shutdown) {
+        write_response(&mut stream, &Response::Ok("shutting down".into()))?;
+        return Ok(true);
     }
     let response = match wire.request {
         Request::Ping => Response::Pong,
@@ -500,8 +574,10 @@ fn handle_client(mut stream: TcpStream, index: &Index, token: &str) -> Result<()
             Ok(()) => Response::Ok("opened containing directory".into()),
             Err(error) => Response::Error(error.to_string()),
         },
+        Request::Shutdown => unreachable!("shutdown handled before index request dispatch"),
     };
-    write_response(&mut stream, &response)
+    write_response(&mut stream, &response)?;
+    Ok(false)
 }
 
 fn write_response(stream: &mut TcpStream, response: &Response) -> Result<()> {
@@ -548,6 +624,187 @@ fn format_bytes(bytes: u64) -> String {
     format!("{value:.1} {}", UNITS[unit])
 }
 
+const DAEMON_LOG_NAME: &str = "daemon.log";
+const DAEMON_PID_NAME: &str = "daemon.pid";
+
+struct DaemonPidFile {
+    path: PathBuf,
+}
+
+impl DaemonPidFile {
+    fn create() -> Result<Self> {
+        let directory = data_dir()?;
+        fs::create_dir_all(&directory)?;
+        let path = directory.join(DAEMON_PID_NAME);
+        fs::write(&path, std::process::id().to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(Self { path })
+    }
+}
+
+impl Drop for DaemonPidFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn daemon_log_path() -> Result<PathBuf> {
+    Ok(data_dir()?.join(DAEMON_LOG_NAME))
+}
+
+fn daemon_pid() -> Option<u32> {
+    fs::read_to_string(data_dir().ok()?.join(DAEMON_PID_NAME))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+fn daemon_is_listening() -> bool {
+    TcpStream::connect_timeout(
+        &ADDRESS.parse().expect("valid loopback address"),
+        Duration::from_millis(100),
+    )
+    .is_ok()
+}
+
+fn daemon_status_response() -> Result<(u16, String)> {
+    match send_request(Request::Status)? {
+        Response::Status { protocol, version } => Ok((protocol, version)),
+        Response::Error(error) => bail!(error),
+        _ => bail!("unexpected daemon status response"),
+    }
+}
+
+fn daemon_status() -> Result<()> {
+    match daemon_status_response() {
+        Ok((protocol, version)) => {
+            let compatible =
+                protocol == IPC_PROTOCOL_VERSION && version == env!("CARGO_PKG_VERSION");
+            println!(
+                "daemon: running{}\nprotocol: {protocol}\nversion: {version}",
+                daemon_pid()
+                    .map(|pid| format!(" (pid {pid})"))
+                    .unwrap_or_default()
+            );
+            println!("compatible: {}", if compatible { "yes" } else { "no" });
+            println!("log: {}", daemon_log_path()?.display());
+            Ok(())
+        }
+        Err(error) if daemon_is_listening() => {
+            println!("daemon: listening but incompatible or unresponsive");
+            println!("compatible: no");
+            println!("log: {}", daemon_log_path()?.display());
+            eprintln!("status request failed: {error:#}");
+            Ok(())
+        }
+        Err(_) => {
+            println!("daemon: stopped");
+            println!("log: {}", daemon_log_path()?.display());
+            Ok(())
+        }
+    }
+}
+
+fn start_daemon(roots: &[PathBuf]) -> Result<()> {
+    match daemon_status_response() {
+        Ok((protocol, version)) => {
+            if protocol == IPC_PROTOCOL_VERSION && version == env!("CARGO_PKG_VERSION") {
+                println!("FlashFind daemon is already running");
+                return Ok(());
+            }
+            bail!("an incompatible daemon is listening on {ADDRESS} (protocol {protocol}, version {version}); stop it before starting this version")
+        }
+        Err(_) if daemon_is_listening() => {
+            bail!("an older or unresponsive daemon is listening on {ADDRESS}; stop that process before starting this version")
+        }
+        Err(_) => {}
+    }
+    let executable = std::env::current_exe().context("could not locate FlashFind executable")?;
+    let directory = data_dir()?;
+    fs::create_dir_all(&directory)?;
+    let log_path = directory.join(DAEMON_LOG_NAME);
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("could not open daemon log {}", log_path.display()))?;
+    let mut command = ProcessCommand::new(executable);
+    command.arg("daemon").arg("run");
+    for root in roots {
+        command.arg("--root").arg(root);
+    }
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log.try_clone()?))
+        .stderr(Stdio::from(log))
+        .spawn()
+        .context("could not start background daemon")?;
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(80));
+        if let Ok((protocol, version)) = daemon_status_response() {
+            if protocol == IPC_PROTOCOL_VERSION && version == env!("CARGO_PKG_VERSION") {
+                println!("FlashFind daemon started (log: {})", log_path.display());
+                return Ok(());
+            }
+        }
+    }
+    bail!(
+        "FlashFind daemon did not start; inspect {}",
+        log_path.display()
+    )
+}
+
+fn stop_daemon() -> Result<()> {
+    match send_request(Request::Shutdown) {
+        Ok(Response::Ok(_)) => {}
+        Ok(Response::Error(error)) => bail!(error),
+        Ok(_) => bail!("unexpected daemon shutdown response"),
+        Err(error) => {
+            if daemon_is_listening() {
+                bail!("a daemon is listening on {ADDRESS} but does not support managed shutdown; stop its process manually, then run `flashfind daemon start` ({error:#})")
+            }
+            if daemon_pid().is_some() {
+                bail!("could not contact managed daemon for shutdown: {error:#}")
+            }
+            println!("FlashFind daemon is not running");
+            return Ok(());
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(40));
+        if daemon_status_response().is_err() {
+            println!("FlashFind daemon stopped");
+            return Ok(());
+        }
+    }
+    bail!("daemon acknowledged shutdown but is still listening on {ADDRESS}")
+}
+
+fn print_daemon_log(lines: usize) -> Result<()> {
+    let path = daemon_log_path()?;
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            println!("no daemon log yet: {}", path.display());
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let lines = lines.max(1);
+    let output = contents.lines().rev().take(lines).collect::<Vec<_>>();
+    for line in output.into_iter().rev() {
+        println!("{line}");
+    }
+    Ok(())
+}
+
 fn ipc_token() -> Result<String> {
     let directory = data_dir()?;
     fs::create_dir_all(&directory)?;
@@ -573,7 +830,14 @@ fn ipc_token() -> Result<String> {
 
 fn ensure_daemon() -> Result<()> {
     match send_request(Request::Status) {
-        Ok(Response::Status { protocol, .. }) if protocol == IPC_PROTOCOL_VERSION => return Ok(()),
+        Ok(Response::Status { protocol, version })
+            if protocol == IPC_PROTOCOL_VERSION && version == env!("CARGO_PKG_VERSION") =>
+        {
+            return Ok(())
+        }
+        Ok(Response::Status { protocol, version }) if protocol == IPC_PROTOCOL_VERSION => {
+            bail!("FlashFind daemon version {version} differs from this CLI ({}); run `flashfind daemon restart`", env!("CARGO_PKG_VERSION"))
+        }
         Ok(Response::Status { protocol, version }) => {
             bail!("FlashFind daemon protocol {protocol} (version {version}) is incompatible; restart the background daemon after upgrading")
         }
@@ -585,22 +849,7 @@ fn ensure_daemon() -> Result<()> {
         }
         _ => {}
     }
-    let executable = std::env::current_exe().context("could not locate FlashFind executable")?;
-    ProcessCommand::new(executable)
-        .arg("daemon")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("could not start background daemon")?;
-    let deadline = Instant::now() + Duration::from_secs(6);
-    while Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(80));
-        if matches!(send_request(Request::Ping), Ok(Response::Pong)) {
-            return Ok(());
-        }
-    }
-    bail!("FlashFind daemon did not start; run `flashfind daemon` to see its error output")
+    start_daemon(&[])
 }
 
 fn delete_path(path: &Path) -> Result<()> {
@@ -1287,7 +1536,7 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
     );
     frame.render_widget(
         Paragraph::new(format!(
-            " {}  │ ↑↓ 选择 │ Enter 打开 │ Shift+Enter 所在目录 │ F2 重命名 │ Delete 删除 │ Esc/Ctrl-C 退出",
+            " {}  │ ↑↓ 选择 · ↵ 打开 · F2 改名 · Del 删除 · Esc 退出",
             app.status
         ))
         .wrap(Wrap { trim: true }),

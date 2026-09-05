@@ -19,7 +19,7 @@ TUI / CLI ──本机回环 TCP + 随机令牌──► flashfind daemon
 - **存储与并发**：SQLite WAL + `synchronous=NORMAL`。监听写入不会阻塞 TUI 读取；根目录重建在单一事务内完成，读取方要么看到旧索引，要么看到完整新索引。
 - **搜索**：路径做 Unicode 小写折叠，并以安全 ASCII 编码的 Unicode 三元组存入 SQLite FTS5；FTS 快速缩小候选集，Rust 精确校验子串。`&` 运算使用候选集交集，`|` 使用并集。
 - **安全**：IPC 仅绑定 `127.0.0.1`，并需 256-bit 随机令牌。Unix 上令牌文件权限为 `0600`。删除/重命名仍受当前用户原有的文件系统权限限制。
-- **监听健壮性**：目录创建、删除、改名可能携带整个子树，守护进程仅重扫该已配置根目录，避免错误的逐项状态。普通文件事件采用单路径增量更新。
+- **监听健壮性**：普通文件事件采用单路径增量更新；目录创建、删除、改名仅替换受影响子树，避免重扫无关的大 root。SQLite 数据目录事件会被忽略；notify/inotify 报告事件溢出时才对 root 执行兜底重建。
 
 ## 构建
 
@@ -104,7 +104,17 @@ invoice | receipt      # OR
 
 ```bash
 # 前台运行，适合调试；首启时显式配置索引根目录
-flashfind daemon --root ~/Documents --root ~/Projects
+flashfind daemon --root ~/Documents --root ~/Projects run
+
+# 前台查看每批原生文件事件和索引更新时使用
+flashfind daemon --verbose run
+
+# 管理后台 daemon：日志位于应用数据目录的 daemon.log
+flashfind daemon start
+flashfind daemon status
+flashfind daemon logs --lines 100
+flashfind daemon restart
+flashfind daemon stop
 
 # 不带路径：建立/重建当前用户主目录；带路径：建立/重建指定根目录。
 # 完成后显示每个 root 的实际索引条目数。
@@ -120,17 +130,23 @@ flashfind search report --limit 1000 --offset 1000
 flashfind roots
 ```
 
-TUI 和 `search` 会尝试连接服务；若不存在便在当前用户会话中后台启动 `flashfind daemon`。TUI 首屏加载 200 条以保持流畅；选择项接近列表末尾时会自动继续加载，不存在 200 条总上限。`flashfind index <新目录>` 后，已运行的 daemon 最多在约 2 秒内发现该 root、建立原生监听，无需手动重启。若希望登录时服务已就绪，可由系统登录项启动：
+TUI 和 `search` 会尝试连接服务；若不存在便在当前用户会话中后台执行等价于 `flashfind daemon start` 的操作。后台服务输出追加到 `daemon.log`，可通过 `flashfind daemon logs` 查看；`status` 会显示运行状态、PID、协议、版本及日志位置。TUI 首屏加载 200 条以保持流畅；选择项接近列表末尾时会自动继续加载，不存在 200 条总上限。`flashfind index <新目录>` 后，已运行的 daemon 最多在约 2 秒内发现该 root、建立原生监听，无需手动重启。若希望登录时服务已就绪，可由系统登录项启动：
 
-- **Linux systemd user unit**：`ExecStart=/绝对路径/flashfind daemon`，执行 `systemctl --user enable --now flashfind`。
-- **macOS LaunchAgent**：启动命令为 `/绝对路径/flashfind daemon`。
-- **Windows Task Scheduler**：创建“用户登录时”任务，动作为 `flashfind.exe daemon`；不需要“使用最高权限”。
+- **Linux systemd user unit**：`ExecStart=/绝对路径/flashfind daemon run`，执行 `systemctl --user enable --now flashfind`。
+- **macOS LaunchAgent**：启动命令为 `/绝对路径/flashfind daemon run`。
+- **Windows Task Scheduler**：创建“用户登录时”任务，动作为 `flashfind.exe daemon run`；不需要“使用最高权限”。
 
 具体服务清单刻意未由程序自动写入，以免未经确认修改用户的系统启动配置。
 
 ### 升级后必须重启后台服务
 
-TUI/CLI 与 daemon 是两个独立进程。升级 `flashfind` 二进制不会替换已经监听在本机端口上的旧 daemon；旧 daemon 也不会执行新版本的 SQLite/FTS migration。自 `v0.1.2` 起，客户端会通过 IPC 协议协商识别这种状态并明确要求重启，而不会静默复用旧服务。使用更早版本时，若升级后 `*` 或其他搜索结果明显过少，先确认版本并重启 daemon：
+TUI/CLI 与 daemon 是两个独立进程。升级 `flashfind` 二进制不会替换已经监听在本机端口上的旧 daemon；旧 daemon 也不会执行新版本的 SQLite/FTS migration。客户端会通过 IPC 协议和版本协商识别这种状态并明确要求重启，而不会静默复用旧服务。升级后先执行：
+
+```bash
+flashfind daemon restart
+```
+
+若提示端口上运行的是更早、不能接受受管关闭请求的 daemon，按提示只手动结束那一次旧进程；之后均可使用上述 CLI 命令。检查索引状态：
 
 ```bash
 flashfind --version        # 应显示当前安装版本，例如 0.1.1
@@ -138,12 +154,7 @@ flashfind roots            # 重启后核对每个 root 的实际条目数
 flashfind search '*' --limit 1000
 ```
 
-- **systemd user service**：`systemctl --user restart flashfind`
-- **macOS LaunchAgent**：重新启动对应 LaunchAgent，或先停止其 `flashfind daemon` 进程。
-- **Windows Task Scheduler**：结束旧任务实例后重新运行任务。
-- **前台/自动拉起 daemon**：先退出旧 `flashfind daemon` 进程，再重新执行 `flashfind` 或 `flashfind daemon`。
-
-在 Linux/macOS 上，确认没有其他 FlashFind 会话后可使用 `pkill -f 'flashfind daemon'`；Windows PowerShell 可使用 `Get-Process flashfind | Stop-Process`。这些命令会同时影响同一用户运行的所有 FlashFind daemon/TUI，请先保存需要的终端操作。
+由 systemd、LaunchAgent 或 Task Scheduler 启动的服务仍应通过相应服务管理器重启；它们运行 `daemon run`，日志通常由服务管理器收集。手动或自动拉起的 FlashFind daemon 则使用 `flashfind daemon restart` 与 `flashfind daemon logs` 管理。
 
 ## 测试
 
