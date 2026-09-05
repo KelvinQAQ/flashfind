@@ -595,14 +595,22 @@ fn apply_events(index: &mut Index, roots: &[PathBuf], events: impl IntoIterator<
             .iter()
             .any(|parent| parent != path && path.starts_with(parent))
     });
+    let mut file_updates = std::collections::BTreeMap::<PathBuf, Vec<PathBuf>>::new();
     for (path, root, subtree) in updates {
-        let result = if subtree {
-            index.refresh_subtree(&path, &root).map(|_| ())
+        if subtree {
+            if let Err(error) = index.refresh_subtree(&path, &root) {
+                eprintln!("subtree refresh failed for {}: {error:#}", path.display());
+            }
         } else {
-            index.refresh_path(&path, &root)
-        };
-        if let Err(error) = result {
-            eprintln!("refresh failed for {}: {error:#}", path.display());
+            file_updates.entry(root).or_default().push(path);
+        }
+    }
+    for (root, paths) in file_updates {
+        if let Err(error) = index.refresh_paths(paths, &root) {
+            eprintln!(
+                "file batch refresh failed for {}: {error:#}",
+                root.display()
+            );
         }
     }
 }

@@ -299,6 +299,32 @@ impl Index {
         Ok(())
     }
 
+    /// Updates several ordinary file paths in one SQLite transaction. Paths
+    /// are deduplicated by the writer before reaching this method.
+    pub fn refresh_paths(
+        &mut self,
+        paths: impl IntoIterator<Item = PathBuf>,
+        root: impl AsRef<Path>,
+    ) -> Result<()> {
+        let root = path_text(&absolute_normalized(root.as_ref())?);
+        let transaction = self.connection.transaction()?;
+        let mut insert = transaction.prepare_cached(INSERT_SQL)?;
+        for path in paths {
+            let path = absolute_normalized(&path)?;
+            remove_exact_path(&transaction, &path_text(&path))?;
+            if path.exists() {
+                if let Err(error) = insert_path(&mut insert, &path, &root) {
+                    if !is_skippable_filesystem_error(&error) {
+                        return Err(error.context(format!("could not refresh {}", path.display())));
+                    }
+                }
+            }
+        }
+        drop(insert);
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Replaces the indexed representation of one directory subtree.
     ///
     /// Directory create, remove, and rename notifications commonly describe a
@@ -1160,6 +1186,36 @@ mod tests {
         assert_eq!(directory_matches.len(), 1);
         assert!(directory_matches[0].path.ends_with("report-directory"));
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn refreshes_multiple_files_in_one_batch() {
+        let root =
+            std::env::temp_dir().join(format!("flashfind-batch-test-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let changed = root.join("changed.txt");
+        let removed = root.join("removed.txt");
+        fs::write(&changed, "x").unwrap();
+        fs::write(&removed, "x").unwrap();
+        let mut index = Index::open(":memory:").unwrap();
+        index.index_root(&root).unwrap();
+        fs::write(&changed, "updated").unwrap();
+        fs::remove_file(&removed).unwrap();
+        index
+            .refresh_paths(vec![changed.clone(), removed.clone()], &root)
+            .unwrap();
+        assert_eq!(
+            index
+                .search("changed", 10)
+                .unwrap()
+                .into_iter()
+                .find(|result| result.path == changed)
+                .unwrap()
+                .size,
+            7
+        );
+        assert!(index.search("removed", 10).unwrap().is_empty());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
