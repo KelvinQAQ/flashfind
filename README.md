@@ -7,7 +7,7 @@
 ## 架构与资源策略
 
 ```text
-TUI / CLI ──本机回环 TCP + 随机令牌──► flashfind daemon
+TUI / CLI ──数据目录私有回环 endpoint + 随机令牌──► flashfind daemon
                                              │
                               SQLite WAL ◄───┼──► notify 原生文件监听
                                              │
@@ -18,7 +18,7 @@ TUI / CLI ──本机回环 TCP + 随机令牌──► flashfind daemon
 - **TUI**：不扫描、不写数据库；只发送查询和文件操作请求。按键输入经 45ms 去抖，避免每个字符都发请求。
 - **存储与并发**：SQLite WAL + `synchronous=NORMAL`。监听写入不会阻塞 TUI 读取；根目录重建在单一事务内完成，读取方要么看到旧索引，要么看到完整新索引。
 - **搜索**：路径做 Unicode 小写折叠，并以安全 ASCII 编码的 Unicode 三元组存入 SQLite FTS5；FTS 快速缩小候选集，Rust 精确校验子串。`&` 运算使用候选集交集，`|` 使用并集。
-- **安全**：IPC 仅绑定 `127.0.0.1`，并需 256-bit 随机令牌。Unix 上令牌文件权限为 `0600`。删除/重命名仍受当前用户原有的文件系统权限限制。
+- **安全与隔离**：daemon 每次在 `127.0.0.1` 的随机端口监听，并将 endpoint 以 `0600` 权限存于应用数据目录；IPC 同时需要 256-bit 随机令牌。不同 `XDG_DATA_HOME` 使用独立 endpoint、索引和 daemon。删除/重命名仍受当前用户原有的文件系统权限限制。
 - **监听健壮性**：普通文件事件采用单路径增量更新；目录创建、删除、改名仅替换受影响子树，避免重扫无关的大 root。SQLite 数据目录事件会被忽略；notify/inotify 报告事件溢出时才对 root 执行兜底重建。
 
 ## 构建

@@ -33,8 +33,8 @@ use std::{
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-const ADDRESS: &str = "127.0.0.1:35185";
-const IPC_PROTOCOL_VERSION: u16 = 5;
+const LOOPBACK_ADDRESS: &str = "127.0.0.1:0";
+const IPC_PROTOCOL_VERSION: u16 = 6;
 const TUI_PAGE_SIZE: usize = 200;
 const CLI_DEFAULT_LIMIT: usize = 1_000;
 const MAX_SEARCH_LIMIT: usize = 10_000;
@@ -284,9 +284,7 @@ fn main() -> Result<()> {
                 MaintenanceAction::Stats => index.database_stats()?,
                 MaintenanceAction::Checkpoint => index.checkpoint()?,
                 MaintenanceAction::Compact => {
-                    if TcpStream::connect_timeout(&ADDRESS.parse()?, Duration::from_millis(100))
-                        .is_ok()
-                    {
+                    if daemon_is_listening() {
                         bail!("stop the FlashFind daemon before compacting: VACUUM requires exclusive database access")
                     }
                     index.compact()?
@@ -301,11 +299,11 @@ fn main() -> Result<()> {
 /// The daemon owns writes and filesystem notifications. TUI clients only read
 /// through a separate SQLite connection managed by this local IPC server.
 fn run_daemon(extra_roots: Vec<PathBuf>, verbose: bool) -> Result<()> {
-    let listener = TcpListener::bind(ADDRESS).with_context(|| {
-        format!("could not bind {ADDRESS}; another FlashFind daemon may already be running")
-    })?;
+    let listener = TcpListener::bind(LOOPBACK_ADDRESS)
+        .context("could not bind a local FlashFind IPC endpoint")?;
     listener.set_nonblocking(true)?;
-    let _pid_file = DaemonPidFile::create()?;
+    let endpoint = listener.local_addr()?;
+    let _pid_file = DaemonPidFile::create(endpoint)?;
     let token = ipc_token()?;
     let read_index = Index::open_default()?;
     let mut roots = read_index.indexed_roots()?;
@@ -371,7 +369,7 @@ fn run_daemon(extra_roots: Vec<PathBuf>, verbose: bool) -> Result<()> {
         });
     }
     eprintln!(
-        "FlashFind daemon listening on {ADDRESS} (pid {})",
+        "FlashFind daemon listening on {endpoint} (pid {})",
         std::process::id()
     );
     loop {
@@ -644,8 +642,18 @@ fn write_response(stream: &mut TcpStream, response: &Response) -> Result<()> {
     Ok(())
 }
 
+fn daemon_endpoint() -> Result<std::net::SocketAddr> {
+    let path = data_dir()?.join(DAEMON_ENDPOINT_NAME);
+    let endpoint = fs::read_to_string(&path)
+        .with_context(|| format!("could not read daemon endpoint {}", path.display()))?;
+    endpoint
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid daemon endpoint in {}", path.display()))
+}
+
 fn send_request(request: Request) -> Result<Response> {
-    let mut stream = TcpStream::connect_timeout(&ADDRESS.parse()?, Duration::from_millis(250))?;
+    let mut stream = TcpStream::connect_timeout(&daemon_endpoint()?, Duration::from_millis(250))?;
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     serde_json::to_writer(
         &mut stream,
@@ -683,29 +691,41 @@ fn format_bytes(bytes: u64) -> String {
 
 const DAEMON_LOG_NAME: &str = "daemon.log";
 const DAEMON_PID_NAME: &str = "daemon.pid";
+const DAEMON_ENDPOINT_NAME: &str = "daemon.addr";
 
 struct DaemonPidFile {
-    path: PathBuf,
+    pid_path: PathBuf,
+    endpoint_path: PathBuf,
 }
 
 impl DaemonPidFile {
-    fn create() -> Result<Self> {
+    fn create(endpoint: std::net::SocketAddr) -> Result<Self> {
         let directory = data_dir()?;
         fs::create_dir_all(&directory)?;
-        let path = directory.join(DAEMON_PID_NAME);
-        fs::write(&path, std::process::id().to_string())?;
+        let pid_path = directory.join(DAEMON_PID_NAME);
+        let endpoint_path = directory.join(DAEMON_ENDPOINT_NAME);
+        let temporary_endpoint =
+            directory.join(format!("{DAEMON_ENDPOINT_NAME}.{}", std::process::id()));
+        fs::write(&pid_path, std::process::id().to_string())?;
+        fs::write(&temporary_endpoint, endpoint.to_string())?;
+        fs::rename(&temporary_endpoint, &endpoint_path)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+            fs::set_permissions(&pid_path, fs::Permissions::from_mode(0o600))?;
+            fs::set_permissions(&endpoint_path, fs::Permissions::from_mode(0o600))?;
         }
-        Ok(Self { path })
+        Ok(Self {
+            pid_path,
+            endpoint_path,
+        })
     }
 }
 
 impl Drop for DaemonPidFile {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        let _ = fs::remove_file(&self.pid_path);
+        let _ = fs::remove_file(&self.endpoint_path);
     }
 }
 
@@ -722,11 +742,9 @@ fn daemon_pid() -> Option<u32> {
 }
 
 fn daemon_is_listening() -> bool {
-    TcpStream::connect_timeout(
-        &ADDRESS.parse().expect("valid loopback address"),
-        Duration::from_millis(100),
-    )
-    .is_ok()
+    daemon_endpoint().ok().is_some_and(|endpoint| {
+        TcpStream::connect_timeout(&endpoint, Duration::from_millis(100)).is_ok()
+    })
 }
 
 fn daemon_status_response() -> Result<(u16, String, WatcherHealth)> {
@@ -757,6 +775,7 @@ fn daemon_status() -> Result<()> {
                 "watcher: {} (roots {}, overflows {})",
                 watcher.state, watcher.watched_roots, watcher.overflow_recoveries
             );
+            println!("endpoint: {}", daemon_endpoint()?);
             if let Some(last_event) = watcher.last_event_unix_ms {
                 println!("last event unix ms: {last_event}");
             }
@@ -788,10 +807,10 @@ fn start_daemon(roots: &[PathBuf]) -> Result<()> {
                 println!("FlashFind daemon is already running");
                 return Ok(());
             }
-            bail!("an incompatible daemon is listening on {ADDRESS} (protocol {protocol}, version {version}); stop it before starting this version")
+            bail!("an incompatible daemon is listening for this data directory (protocol {protocol}, version {version}); stop it before starting this version")
         }
         Err(_) if daemon_is_listening() => {
-            bail!("an older or unresponsive daemon is listening on {ADDRESS}; stop that process before starting this version")
+            bail!("an older or unresponsive daemon is listening for this data directory; stop that process before starting this version")
         }
         Err(_) => {}
     }
@@ -838,7 +857,7 @@ fn stop_daemon() -> Result<()> {
         Ok(_) => bail!("unexpected daemon shutdown response"),
         Err(error) => {
             if daemon_is_listening() {
-                bail!("a daemon is listening on {ADDRESS} but does not support managed shutdown; stop its process manually, then run `flashfind daemon start` ({error:#})")
+                bail!("a daemon is listening for this data directory but does not support managed shutdown; stop its process manually, then run `flashfind daemon start` ({error:#})")
             }
             if daemon_pid().is_some() {
                 bail!("could not contact managed daemon for shutdown: {error:#}")
@@ -855,7 +874,7 @@ fn stop_daemon() -> Result<()> {
             return Ok(());
         }
     }
-    bail!("daemon acknowledged shutdown but is still listening on {ADDRESS}")
+    bail!("daemon acknowledged shutdown but is still listening")
 }
 
 fn print_daemon_log(lines: usize) -> Result<()> {
